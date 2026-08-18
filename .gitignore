@@ -1,0 +1,35 @@
+# 密钥与配置
+.env
+.env.local
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 数据与缓存
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/knowledge_db/
+
+# 运行时生成物
+data/*.log
+data/logs_*.txt
+data/phase*.json
+
+# 生成物
+reports/
+*.pdf
+*.html
+*.png
+*.xlsx
+
+# IDE
+.idea/
+.vscode/

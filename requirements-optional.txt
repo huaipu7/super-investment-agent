@@ -1,0 +1,12 @@
+# ============================================================
+# 可选依赖（按需安装，避免一次性拉取 torch 等重包）
+# 安装命令: D:\python\python.exe -m pip install -r requirements-optional.txt
+# ============================================================
+
+# ── RAG 检索增强（默认关闭；启用需设置 RAG_ENABLED=true）───
+# sentence-transformers>=5.4.0     # 会拉取 torch，体积大
+# faiss-cpu>=1.13.0
+
+# ── PDF 增强（PyMuPDF 读取/校验；weasyprint 需系统 Pango，备选）─
+# PyMuPDF>=1.27.0
+# weasyprint>=68.0
