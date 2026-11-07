@@ -39,6 +39,10 @@ CACHE_TTL = {
     "briefings": 3600,     # 业绩说明会/投资者关系公告 1 小时（公告变更慢）
     "meetings": 86400,     # 股东大会（stock_gddh_em 全市场抓取较重，日更一次）
     "sentiment": 600,      # 市场情绪 10 分钟（情绪变化慢，避免频繁打上游数据源）
+    # Phase 1：固收零 key 源
+    "treasury_curve": 3600,    # 美元国库每日收益率曲线 1 小时（日更，足够）
+    "edgar_facts": 86400,      # SEC companyfacts 24 小时（官方日更一次）
+    "fomc_statement": 86400,   # FOMC 声明 24 小时
 }
 
 

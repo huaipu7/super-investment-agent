@@ -18,10 +18,15 @@ _KIND_LABEL = {"image": "图片(OCR)", "audio": "音频转写", "video": "视频
 _UPLOAD_KEYS = ("up_img", "up_aud", "up_vid")
 
 
-def _stream_into(prompt: str, resp, placeholder, status_ph) -> str:
-    """消费后端 SSE 响应：status→阶段进度，token→逐字追加渲染，返回完整文本。"""
+def _stream_into(prompt: str, resp, placeholder, status_ph) -> tuple[str, dict]:
+    """消费后端 SSE 响应：status→阶段进度，token→逐字追加渲染。
+
+    返回 (完整文本, {msg_id, request_id})：反馈要靠这两个 id 才能归因，
+    流式文本本身没有可关联的标识。
+    """
     text = ""
     evt = None
+    ids = {"request_id": resp.headers.get("X-Request-Id") or "", "msg_id": ""}
     resp.encoding = "utf-8"
     for raw in resp.iter_lines(decode_unicode=True):
         line = (raw or "").strip()
@@ -45,9 +50,62 @@ def _stream_into(prompt: str, resp, placeholder, status_ph) -> str:
                 placeholder.markdown(text)
                 break
             elif evt == "done":
+                ids["msg_id"] = data.get("msg_id") or ids["msg_id"]
+                ids["request_id"] = data.get("request_id") or ids["request_id"]
                 break
     status_ph.empty()
-    return text
+    return text, ids
+
+
+# ── 反馈（数据飞轮入口）─────────────────────────────────────
+
+_ISSUES = ["数字不对", "来源不可信", "没有回答我的问题", "内容过时"]
+
+
+def can_feedback(m: dict) -> bool:
+    """只有拿到关联键的消息才给反馈入口；历史消息缺 id 就不显示（不摆坏按钮）。"""
+    return bool((m.get("msg_id") or "").strip() and (m.get("request_id") or "").strip())
+
+
+def _submit_feedback(rid: str, mid: str, label: str, *, scope: str = "message",
+                     fact_id: str | None = None, options: list[str] | None = None,
+                     note: str | None = None) -> bool:
+    try:
+        api.feedback(rid, mid, label, scope=scope, fact_id=fact_id,
+                     options=options, note=note)
+    except api.ApiError as e:
+        st.error(f"反馈提交失败：{e}")
+        return False
+    st.session_state.setdefault("fb_done", {})[mid] = label
+    return True
+
+
+def _feedback_row(m: dict) -> None:
+    mid, rid = m["msg_id"], m["request_id"]
+    done = (st.session_state.get("fb_done") or {}).get(mid)
+    if done:
+        st.caption("✅ 已记录 · 👍 有帮助" if done == "up"
+                   else "✅ 已记录 · 👎 进入待审队列，需人工审阅（不会自动进回归集）")
+        return
+
+    st.caption("这条回答有帮助吗？")
+    c1, c2 = st.columns([1, 1])
+    if c1.button("👍 有帮助", key=f"fb_up_{mid}"):
+        if _submit_feedback(rid, mid, "up"):
+            st.rerun()
+    if c2.button("👎 有问题", key=f"fb_down_{mid}"):
+        st.session_state["fb_open"] = mid
+        st.rerun()
+
+    if st.session_state.get("fb_open") != mid:
+        return
+    with st.form(f"fb_form_{mid}"):
+        picks = st.multiselect("哪里不对？（可多选）", _ISSUES, key=f"fb_opts_{mid}")
+        note = st.text_input("补充说明（选填）", key=f"fb_note_{mid}")
+        if st.form_submit_button("提交反馈"):
+            if _submit_feedback(rid, mid, "down", options=picks, note=note):
+                st.session_state.pop("fb_open", None)
+                st.rerun()
 
 
 def _process_upload(f, widget_key: str) -> None:
@@ -146,6 +204,8 @@ def page() -> None:
     for m in st.session_state.messages:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
+            if m["role"] == "assistant" and can_feedback(m):
+                _feedback_row(m)
 
     if prompt := st.chat_input("问点什么…"):
         attach_ctx = _attachment_context()
@@ -165,7 +225,7 @@ def page() -> None:
         with st.chat_message("assistant"):
             placeholder = st.empty()
             status_ph = st.empty()
-            text = _stream_into(prompt, resp, placeholder, status_ph)
+            text, ids = _stream_into(prompt, resp, placeholder, status_ph)
         if not text.strip():
             text = "（无输出）"
-        st.session_state.messages.append({"role": "assistant", "content": text})
+        st.session_state.messages.append({"role": "assistant", "content": text, **ids})

@@ -11,6 +11,9 @@ import urllib.request
 import urllib.parse
 
 from app.agent.llm import chat, chat_tool_calls
+from app.llm.schemas import IntentResult
+from app.llm.structured import parse_llm_json
+from app.memory.context import build_memory_context
 
 # ===== 中英文公司名 → Ticker 映射表（兜底用） =====
 TICKER_MAP = {
@@ -151,14 +154,14 @@ PARSE_INTENT_TOOL = {
                     "description": "股票代码列表。美股用直接代码如 AAPL/MSFT/GOOGL, 港股加 .HK 后缀如 0700.HK/3690.HK, A股加 .SS 或 .SZ 后缀如 600519.SS"
                 },
                 "timeframe": {
-                    "type": "string",
-                    "enum": ["1d", "5d", "1mo", "3mo", "6mo", "ytd", "1y", "5y", "max"],
-                    "description": "查询的时间范围。1d=日内, 5d=五天, 1mo=一个月, 3mo=三个月, 6mo=六个月, ytd=年初至今, 1y=一年, 5y=五年, max=全部"
+                    "type": ["string", "null"],
+                    "enum": ["1d", "5d", "1mo", "3mo", "6mo", "ytd", "1y", "5y", "max", None],
+                    "description": "查询的时间范围。1d=日内, 5d=五天, 1mo=一个月, 3mo=三个月, 6mo=六个月, ytd=年初至今, 1y=一年, 5y=五年, max=全部。用户未指定且非 query_price 时可省略或传 null"
                 },
                 "analysis_type": {
-                    "type": "string",
-                    "enum": ["valuation", "trend", "financial_health", "general"],
-                    "description": "分析类型。仅当 intent=analysis 时有效: valuation=估值分析, trend=趋势分析, financial_health=财务健康, general=综合分析"
+                    "type": ["string", "null"],
+                    "enum": ["valuation", "trend", "financial_health", "general", None],
+                    "description": "分析类型。仅当 intent=analysis 时有效: valuation=估值分析, trend=趋势分析, financial_health=财务健康, general=综合分析。其他意图传 null"
                 },
                 "company_names": {
                     "type": "array",
@@ -179,9 +182,8 @@ def _parse_with_llm(user_input: str) -> dict | None:
             {"role": "system", "content": INTENT_SYSTEM_PROMPT},
             {"role": "user", "content": user_input},
         ], task="intent")
-        # 清理可能的 markdown 包裹
-        result = result.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        return json.loads(result)
+        return parse_llm_json(result, model=IntentResult, default=None,
+                              context="意图识别(JSON)")
     except Exception:
         return None
 
@@ -315,14 +317,8 @@ def _parse_with_function_calling(user_input: str) -> dict | None:
 
         for tc in tool_calls:
             if tc["name"] == "parse_investment_intent":
-                args = json.loads(tc["arguments"])
-                return {
-                    "intent": args.get("intent"),
-                    "tickers": args.get("tickers", []),
-                    "timeframe": args.get("timeframe"),
-                    "analysis_type": args.get("analysis_type"),
-                    "company_names": args.get("company_names", []),
-                }
+                return parse_llm_json(tc["arguments"], model=IntentResult, default=None,
+                                      context="意图识别(FC)")
         return None
     except Exception:
         return None
@@ -368,9 +364,11 @@ def parse(user_input: str, history: list[dict] = None) -> dict:
             "raw_input": str
         }
     """
-    # 构建上下文前缀（追问时帮助 LLM 理解语境）
+    # 构建上下文前缀：长期背景（画像/摘要）+ 追问语境，帮助 LLM 理解当前提问
+    memory_prefix = build_memory_context()
     context_prefix = _build_context_prefix(history) if history else ""
-    llm_input = context_prefix + user_input if context_prefix else user_input
+    parts = [p for p in (memory_prefix, context_prefix) if p]
+    llm_input = "\n".join(parts) + "\n" + user_input if parts else user_input
 
     # 第1优先：Function Calling 解析（使用增强后的输入）
     parsed = _parse_with_function_calling(llm_input)
@@ -384,6 +382,7 @@ def parse(user_input: str, history: list[dict] = None) -> dict:
             "timeframe": timeframe if timeframe else _extract_timeframe_fallback(user_input),
             "analysis_type": parsed.get("analysis_type"),
             "raw_input": user_input,
+            "confidence": "high",
         }
 
     # 第2优先：传统 LLM prompt 解析（使用增强后的输入）
@@ -398,9 +397,11 @@ def parse(user_input: str, history: list[dict] = None) -> dict:
             "timeframe": timeframe if timeframe else _extract_timeframe_fallback(user_input),
             "analysis_type": parsed.get("analysis_type"),
             "raw_input": user_input,
+            "confidence": "high",
         }
 
     # 第3优先：规则兜底（使用原始输入，不添加上下文前缀）
+    # confidence=low 是真的低：这条路径靠关键词猜意图，模板外需求要另想办法。
     tickers = _extract_ticker_fallback(user_input)
     timeframe = _extract_timeframe_fallback(user_input)
     intent = _detect_intent_fallback(user_input)
@@ -411,4 +412,5 @@ def parse(user_input: str, history: list[dict] = None) -> dict:
         "timeframe": timeframe,
         "analysis_type": "general" if intent == "analysis" else None,
         "raw_input": user_input,
+        "confidence": "low",
     }

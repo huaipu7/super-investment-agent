@@ -248,3 +248,59 @@ def render_financials(fin: dict | None) -> None:
     for col, (key, label, formatter) in zip(cols, cells):
         val = fin.get(key)
         col.metric(label, formatter(val) if val is not None else "—")
+
+
+# ── 红队 ──────────────────────────────────────────────
+
+_REDTEAM_STATUS = {
+    "ok": ("✅", "反方论证全部有真实引用"),
+    "insufficient_evidence": ("⚠️", "证据不足，条数不够就说不算"),
+    "llm_unavailable": ("⚪", "模型不可用，未生成反方论证"),
+}
+
+
+def render_redteam(rt: dict | None) -> None:
+    """展示红队三段。没有红队（quick/standard 档）时什么都不画。"""
+    if not isinstance(rt, dict) or not rt:
+        return
+
+    icon, label = _REDTEAM_STATUS.get(rt.get("status"), ("•", "状态未知"))
+    st.markdown(f"##### 🥊 红队 · {icon} {label}")
+    if rt.get("note"):
+        st.caption(rt["note"])
+
+    counter = rt.get("counter_arguments") or []
+    if counter:
+        st.dataframe(pd.DataFrame([{
+            "反方论证": c.get("point"),
+            "引用": c.get("evidence_ref"),
+            "依据": (c.get("evidence") or {}).get("value") or "—",
+            "为什么": c.get("why") or "—",
+        } for c in counter]), width="stretch", hide_index=True)
+    elif rt.get("status") == "llm_unavailable":
+        st.caption("没有反方论证——不是因为没有反方，而是模型没给出可核对的说法。")
+
+    dropped = rt.get("dropped") or []
+    if dropped:
+        with st.expander(f"被丢弃的反方论证（{len(dropped)} 条，引用对不上）",
+                         expanded=False):
+            st.caption("这些是模型写了但挂不住引用的部分。留着是为了让你看见它编过什么，"
+                       "它们不计入任何结论。")
+            for d in dropped:
+                st.caption(f"　· {d.get('point')}　——　{d.get('reason')}")
+
+    frag = rt.get("fragile_assumption")
+    if isinstance(frag, dict):
+        st.markdown("**🪜 最脆弱的一环**")
+        st.caption(f"{frag.get('assumption')}　（引用 `{frag.get('evidence_ref')}`："
+                   f"{(frag.get('evidence') or {}).get('value') or '—'}）")
+        if frag.get("why"):
+            st.caption(frag["why"])
+    else:
+        st.caption("🪜 最脆弱的一环：本次没有可判定的已验假设。")
+
+    oq = rt.get("open_questions") or []
+    if oq:
+        st.markdown("**❓ 未解决问题（不知道就是不知道）**")
+        for q in oq:
+            st.caption(f"　· {q}")

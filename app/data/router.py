@@ -3,8 +3,9 @@
 
 按市场路由：
   - A 股（6 位代码或 .SS/.SZ/.BJ 后缀）→ Sina 行情 + AKShare 财务/财报
+  - 美股（纯字母代码）→ 东方财富美股 F10 财报，失败回退 yfinance
   - 港股（.HK 后缀）→ yfinance
-  - 其他（美股等）→ yfinance
+  - 其他 → yfinance
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import pandas as pd
 from app.data.cache import get_cache, CACHE_TTL
 from app.data.vintage import build_vintage
 from app.data.sources.akshare_source import AKShareSource, normalize_ashare_code
+from app.data.sources.akshare_us_source import AKShareUSSource
 from app.data.sources.fund_source import (
     fund_search,
     fund_search_by_code,
@@ -30,6 +32,7 @@ from app.data.sources.fund_source import (
 from app.data.sources.sina_source import SinaSource
 from app.data.sources.yfinance_source import YFinanceSource
 from app.observability.metrics import metrics as _metrics
+from app.utils.logger import logger
 
 
 def _ds_instrument(name: str):
@@ -116,6 +119,7 @@ class MarketData:
         self._yf = YFinanceSource()
         self._ak = AKShareSource()
         self._sina = SinaSource()
+        self._us = AKShareUSSource()
 
     @property
     def yfinance(self) -> YFinanceSource:
@@ -128,6 +132,10 @@ class MarketData:
     @property
     def sina(self) -> SinaSource:
         return self._sina
+
+    @property
+    def akshare_us(self) -> AKShareUSSource:
+        return self._us
 
     # ── 行情 ──────────────────────────────────────────────────
 
@@ -170,6 +178,7 @@ class MarketData:
         df = self._history_df(ticker, "max", as_of_dt)
         if df is None or df.empty:
             raise ValueError(f"无法从历史序列构建 {ticker} as_of={as_of_dt.date()} 行情（无数据）")
+        src = (df.attrs or {}).get("source") or _source_label(ticker)
         df = _to_datetime_index(df)
         hist = df.loc[df.index <= as_of_dt]
         if hist.empty:
@@ -189,7 +198,7 @@ class MarketData:
         quote["vintage"] = build_vintage(
             requested_as_of=str(as_of_dt.date()),
             data_observation_date=str(hist.index[-1].date()),
-            source=_source_label(ticker),
+            source=src,
             is_point_in_time=True,
             note="由历史日线取 ≤as_of 最后一根构建（真实点对点，非最新快照改写）",
         )
@@ -209,6 +218,9 @@ class MarketData:
                     cache.set_dataframe(df, CACHE_TTL["history_long"], *ck)
         else:
             df = self._history_df(ticker, period, None)
+        # 兜底源会改写 attrs["source"]，溯源标签要跟实际取数通路一致
+        src = ((getattr(df, "attrs", None) or {}).get("source")
+               if df is not None else None) or _source_label(ticker)
         df = _to_datetime_index(df)
         if as_of_dt is not None and df is not None and not df.empty:
             df = df.loc[df.index <= as_of_dt]
@@ -216,7 +228,7 @@ class MarketData:
             df.attrs["vintage"] = build_vintage(
                 requested_as_of=str(as_of_dt.date()) if as_of_dt is not None else None,
                 data_observation_date=str(df.index[-1].date()),
-                source=_source_label(ticker),
+                source=src,
                 is_point_in_time=True,
                 note=("历史行情序列锚定 ≤as_of（真实点对点）" if as_of_dt is not None
                       else "实时历史序列（无 as_of 锚定）"),
@@ -243,6 +255,8 @@ class MarketData:
         """获取历史行情 DataFrame；as_of_dt 非空时序列已截断到 ≤as_of。
 
         A 股 → akshare(东财，start/end 截断)，失败回退 Sina 日线；
+        港股 → yfinance，失败回退东财港股日线（Yahoo 对本机是 IP 级限流，
+                Sina 美股日线对 .HK 无效，没有专门分支时整段行情会缺失）；
         其他 → yfinance(start/end 截断)，失败回退 Sina 美股日线。
         """
         if is_ashare(ticker):
@@ -260,6 +274,28 @@ class MarketData:
             if df.empty:
                 df = self._ak.get_ashare_daily(code, period)
             return df if df.empty else _slice_period(df, period)
+
+        if is_hk(ticker):
+            try:
+                if as_of_dt is not None:
+                    start = (as_of_dt - dt.timedelta(days=3650)).strftime("%Y-%m-%d")
+                    df = self._yf.fetch_price_history(
+                        ticker, start=start, end=as_of_dt.strftime("%Y-%m-%d"))
+                else:
+                    df = self._yf.get_history(ticker, period)
+                if df is not None and not df.empty:
+                    return df
+            except Exception:
+                pass
+            df = self._ak.get_hk_history(ticker, period)
+            if not df.empty:
+                if as_of_dt is not None:
+                    df = df.loc[df.index <= as_of_dt]
+                # 港股默认标 yfinance，走到这里说明实际是东财数据，溯源得说实话
+                df.attrs["source"] = "akshare"
+                return df
+            raise ValueError(f"无法获取 {ticker} 历史行情"
+                             f"（as_of={as_of_dt.date() if as_of_dt else None}）")
 
         try:
             if as_of_dt is not None:
@@ -297,7 +333,14 @@ class MarketData:
             fin = self._ak.get_financial_indicators(
                 normalize_ashare_code(ticker), start_year=start_year)
         else:
-            fin = self._yf.get_financials(ticker)
+            # 美股优先东财 F10；非美股代码返回空字典，自然回退 yfinance
+            fin = self._us.get_financials(ticker)
+            if not fin:
+                try:
+                    fin = self._yf.get_financials(ticker)
+                except Exception as e:
+                    logger.warning("东财与 yfinance 均未取到 %s 财务概览，如实返回空: %s", ticker, e)
+                    fin = {}
         fin = dict(fin)
         fin["vintage"] = build_vintage(
             requested_as_of=str(as_of_dt.date()) if as_of_dt is not None else None,
@@ -331,7 +374,15 @@ class MarketData:
         if is_ashare(ticker):
             stmts = self._ak.fetch_all_financials(ticker, period)
         else:
-            stmts = self._yf.fetch_all_financials(ticker, period)
+            # 美股优先走东财 F10（国内直连，不受 Yahoo 反爬影响）；
+            # 非美股代码（港股等）在此返回全空，自然回退 yfinance。
+            stmts = self._us.fetch_all_financials(ticker, period)
+            if not any(not df.empty for df in stmts.values()):
+                try:
+                    stmts = self._yf.fetch_all_financials(ticker, period)
+                except Exception as e:
+                    logger.warning("东财与 yfinance 均未取到 %s 财报，如实返回空: %s", ticker, e)
+                    stmts = {k: pd.DataFrame() for k in ("income", "balance_sheet", "cash_flow")}
 
         ttl = (CACHE_TTL.get("financials_quarterly")
                if period == "quarterly" else CACHE_TTL.get("financials_annual", 3600))
@@ -375,7 +426,20 @@ class MarketData:
                     info["name"] = quote["name"]
                     info.setdefault("currency", "CNY")
             return info
-        return self._yf.fetch_company_info(ticker)
+        # 美股优先东财 F10；非美股代码返回的 name 仍是代码本身，据此判定未命中
+        info = self._us.fetch_company_info(ticker)
+        if info.get("name") and info["name"] != ticker.strip().upper():
+            return info
+        try:
+            yf_info = self._yf.fetch_company_info(ticker)
+        except Exception as e:
+            logger.warning("东财与 yfinance 均未取到 %s 公司信息，回退基础字段: %s", ticker, e)
+            return info
+        # 东财缺 sector/industry/summary，用 yfinance 补齐（yfinance 有值时优先）
+        for k, v in yf_info.items():
+            if v not in (None, "", []):
+                info[k] = v
+        return info
 
     # ── 新闻 / 业绩说明会 / 股东大会（Phase 9）───────────────
 

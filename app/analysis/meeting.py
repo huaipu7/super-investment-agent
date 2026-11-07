@@ -4,10 +4,10 @@
 无数据（None/空列表）时如实返回 available=False，不调用 LLM。
 """
 
-import json
-
 from app.utils.logger import logger
 from app.analysis.llm import analysis_llm
+from app.llm.schemas import MeetingResult
+from app.llm.structured import parse_llm_json
 
 MEETING_SYSTEM_PROMPT = """你是一位公司治理分析师，擅长从股东大会材料中识别重大治理与经营信号。
 你的分析必须严格基于提供的股东大会记录，不得引入外部或虚构信息。输出结构化 JSON。"""
@@ -90,7 +90,8 @@ class MeetingAnalyzer:
                 max_tokens=1024,
                 system_prompt=MEETING_SYSTEM_PROMPT,
             )
-            result = self._parse_json(response, {})
+            result = parse_llm_json(response, model=MeetingResult, default={},
+                                    context="股东大会")
             if not isinstance(result, dict):
                 result = {}
         except Exception as e:
@@ -138,16 +139,3 @@ class MeetingAnalyzer:
             "reason": reason,
         }
 
-    def _parse_json(self, text, default):
-        if not text:
-            return default
-        t = text.strip()
-        if "```json" in t:
-            t = t.split("```json", 1)[1].split("```", 1)[0].strip()
-        elif "```" in t:
-            t = t.split("```", 1)[1].rsplit("```", 1)[0].strip()
-        try:
-            return json.loads(t)
-        except json.JSONDecodeError:
-            logger.warning("股东大会 LLM 返回非 JSON: %s", t[:100])
-            return default

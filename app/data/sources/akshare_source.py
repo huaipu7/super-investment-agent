@@ -502,6 +502,36 @@ class AKShareSource(DataSource):
         df = df.drop(columns=["Date"]).sort_index()
         return df.tail(_PERIOD_WINDOW.get(period, len(df)))
 
+    def get_hk_history(self, ticker: str, period: str = "1mo") -> pd.DataFrame:
+        """东财港股日线（stock_hk_hist），yfinance 被 IP 级限流时的兜底。
+
+        取不复权价：实测与 yfinance 的 Close 逐日一致（0700.HK 2026-11-03 均 397.2），
+        换 qfq/hfq 会让同一日期对不上，拼接两段序列就成了假数据。
+        """
+        import akshare as ak
+        code = ticker.strip().upper().replace(".HK", "").strip()
+        if not code.isdigit():
+            return pd.DataFrame()
+        code = code.zfill(5)
+        today = datetime.date.today().strftime("%Y%m%d")
+        try:
+            df = _retry_em(lambda: ak.stock_hk_hist(
+                symbol=code, period="daily", start_date="19900101",
+                end_date=today, adjust=""))
+        except Exception:
+            return pd.DataFrame()
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.rename(columns={"日期": "Date", "开盘": "Open", "最高": "High",
+                                "最低": "Low", "收盘": "Close", "成交量": "Volume"})
+        cols = ["Date", "Open", "High", "Low", "Close", "Volume"]
+        if not all(c in df.columns for c in cols):
+            return pd.DataFrame()
+        df = df[cols].copy()
+        df.index = pd.to_datetime(df["Date"])
+        df = df.drop(columns=["Date"]).sort_index()
+        return df.tail(_PERIOD_WINDOW.get(period, len(df)))
+
     def get_us_history(self, ticker: str, period: str = "1mo") -> pd.DataFrame:
         """Sina 美股日线（stock_us_daily），yfinance 不可用时兜底。"""
         import akshare as ak

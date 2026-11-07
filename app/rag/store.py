@@ -28,11 +28,28 @@ from app.rag.embed import RemoteEmbeddingFunction, get_embedding_function
 from app.utils.logger import logger
 
 COLLECTION_NAME = "invest"
+# HNSW 参数只在建集合时生效，事后不可修改（chromadb 连 metadata.modify 都拒绝）。
+# 默认 M=16 在 2 万级语料上图连通性不足：实测 12 条探针里 2 条的全库查询丢掉
+# 真 top-1（最高分差 0.16），个别向量连自查询都找不回自己。M=48 后 0/12 泄漏、
+# 自查询 39/39，单次查询 20ms（原 15ms）。已有库的重建见 scripts/rebuild_index.py。
+HNSW_METADATA = {
+    "hnsw:space": "cosine",
+    "hnsw:M": 48,
+    "hnsw:construction_ef": 400,
+    "hnsw:search_ef": 1000,
+}
 
 
 def doc_id(*parts: str) -> str:
     """内容哈希 id，同一 source+正文 入库天然去重。"""
     return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def _where_clause(where: dict | None) -> dict | None:
+    """把裸多键 dict 包成 $and —— Chroma 只接受单算子，多键会直接报错。"""
+    if where and len(where) > 1 and not any(str(k).startswith("$") for k in where):
+        return {"$and": [{k: v} for k, v in where.items()]}
+    return where
 
 
 class KnowledgeStore:
@@ -65,7 +82,7 @@ class KnowledgeStore:
                     self._collection = self._client.get_or_create_collection(
                         name=COLLECTION_NAME,
                         embedding_function=self._ef,
-                        metadata={"hnsw:space": "cosine"},
+                        metadata=HNSW_METADATA,
                     )
         return self._collection
 
@@ -75,6 +92,11 @@ class KnowledgeStore:
         if isinstance(self._ef, RemoteEmbeddingFunction):
             return "远程嵌入 API"
         return "本地 bge-small-zh-v1.5"
+
+    @property
+    def persist_dir(self) -> str:
+        """库目录。重排器靠它判断是不是 v1 只读快照（那边必须强制旁路）。"""
+        return str(self._persist_dir)
 
     def available(self) -> bool:
         """嵌入后端可用性（不可用时调用方回退无 RAG 分支，不崩溃）。
@@ -90,14 +112,19 @@ class KnowledgeStore:
         except Exception:
             return False
 
-    def all_docs(self, limit: int = 10000) -> list[dict]:
-        """取集合内全部文档 [{id, page_content, metadata}]，供词法检索粗召回。
+    def all_docs(self, limit: int | None = 10000,
+                 where: dict | None = None) -> list[dict]:
+        """取文档 [{id, page_content, metadata}]，供词法检索粗召回。
 
+        where 过滤语义与 query 一致（多键自动包 $and）。按 where 取单路语料时
+        建议传 limit=None：单路可能超过默认 1 万条（实测「披露文件」13,504 条，
+        默认上限会把整路语料截断，且截断发生在 chroma 侧、按内部顺序，静默丢块）。
         col.get 不触发嵌入，无后端时也能用（词法降级路径依赖它）。
         """
         col = self._ensure()
         try:
-            res = col.get(include=["documents", "metadatas"], limit=limit)
+            res = col.get(where=_where_clause(where),
+                          include=["documents", "metadatas"], limit=limit)
         except Exception as e:
             logger.warning("知识库 all_docs 失败: %s", e)
             return []
@@ -150,7 +177,7 @@ class KnowledgeStore:
         try:
             res = col.query(
                 query_texts=[text],
-                where=where,
+                where=_where_clause(where),
                 n_results=top_k,
                 include=["documents", "metadatas", "distances"],
             )
@@ -182,11 +209,39 @@ class KnowledgeStore:
         col = self._ensure()
         try:
             if where:
-                return len(col.get(where=where, include=[])["ids"])
+                return len(col.get(where=_where_clause(where), include=[])["ids"])
             return col.count()
         except Exception as e:
             logger.warning("知识库 count 失败: %s", e)
             return 0
+
+    def ids_where(self, where: dict | None = None, limit: int = 10000) -> list[str]:
+        """按 where 取切片 id（不触发嵌入）。用于只删「重切后多出来的旧块」。
+
+        多字段必须显式包成 $and：Chroma 的 get 不接受裸的多键 dict。
+        """
+        col = self._ensure()
+        try:
+            res = col.get(where=_where_clause(where), limit=limit, include=[])
+        except Exception as e:
+            logger.warning("知识库 ids_where 失败: %s", e)
+            return []
+        return list(res.get("ids") or [])
+
+    def delete_ids(self, ids: list[str], batch: int = 512) -> int:
+        """按 id 精确删除，返回删除条数。"""
+        if not ids:
+            return 0
+        col = self._ensure()
+        deleted = 0
+        for i in range(0, len(ids), batch):
+            part = ids[i : i + batch]
+            try:
+                col.delete(ids=part)
+                deleted += len(part)
+            except Exception as e:
+                logger.warning("知识库 delete_ids 失败（本批 %d 条）: %s", len(part), e)
+        return deleted
 
     def delete(self, where: dict):
         col = self._ensure()

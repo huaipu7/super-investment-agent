@@ -55,6 +55,8 @@ class _PersistentHistory(list):
                 item.get("text", ""),
                 intent=item.get("intent"),
                 tickers=item.get("tickers"),
+                # 反馈关联键：assistant 条目 id 形如 "ab12cd34-r"
+                msg_id=item.get("id"),
             )
         except Exception:  # noqa: BLE001 记忆落库失败不影响对话主流程
             pass
@@ -67,6 +69,15 @@ chat_history = _PersistentHistory()
 def sse_event(event: str, data: dict) -> str:
     """格式化 SSE 事件"""
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _assistant_ids(msg_id: str, rid: str) -> dict:
+    """助手消息的关联键。前端没有它们就提交不了可归因的反馈。"""
+    return {"msg_id": f"{msg_id}-r", "request_id": rid}
+
+
+def _reply_payload(text: str, msg_id: str, rid: str) -> dict:
+    return {"reply": text, **_assistant_ids(msg_id, rid)}
 
 
 async def _run_sync(fn, *args, **kwargs):
@@ -101,7 +112,7 @@ async def chat(user_input: str = Form(...)):
             if ambiguous:
                 reply += "\n" + build_question(ambiguous)
             chat_history.append({"role": "assistant", "text": reply, "id": msg_id + "-r"})
-            return {"reply": reply}
+            return _reply_payload(reply, msg_id, rid)
     else:
         # ===== 正常流程：意图识别 =====
         try:
@@ -110,7 +121,7 @@ async def chat(user_input: str = Form(...)):
         except Exception as e:
             reply = f"意图识别异常：{str(e)}"
             chat_history.append({"role": "assistant", "text": reply, "id": msg_id + "-r"})
-            return {"reply": reply}
+            return _reply_payload(reply, msg_id, rid)
 
         # ===== 检查多市场歧义 =====
         if intent.get("tickers"):
@@ -125,7 +136,7 @@ async def chat(user_input: str = Form(...)):
                 ))
                 reply = build_question(ambiguous)
                 chat_history.append({"role": "assistant", "text": reply, "id": msg_id + "-r"})
-                return {"reply": reply}
+                return _reply_payload(reply, msg_id, rid)
 
     try:
         memory_db.tag_last_user_message(intent.get("intent"), intent.get("tickers"))
@@ -138,7 +149,7 @@ async def chat(user_input: str = Form(...)):
             reply = ("未能识别出股票代码。请明确公司名称或股票代码，例如：\n"
                      "- 苹果公司股价\n- NVDA 最近走势\n- 分析腾讯控股")
             chat_history.append({"role": "assistant", "text": reply, "id": msg_id + "-r"})
-            return {"reply": reply}
+            return _reply_payload(reply, msg_id, rid)
 
         t0 = time.perf_counter()
         plan = build_plan(intent)
@@ -153,13 +164,13 @@ async def chat(user_input: str = Form(...)):
             maybe_roll_summary()
         except Exception:  # noqa: BLE001
             pass
-        return {"reply": report}
+        return _reply_payload(report, msg_id, rid)
 
     except Exception as e:
         reply = f"处理请求时出现异常：{str(e)}"
         chat_history.append({"role": "assistant", "text": reply, "id": msg_id + "-r"})
         audit("chat.error", {"msg_id": msg_id, "error": str(e)}, request_id=rid)
-        return {"reply": reply}
+        return _reply_payload(reply, msg_id, rid)
 
 
 @router.get("/history")
@@ -196,33 +207,39 @@ async def chat_fund(user_input: str = Form(...)):
             reply = ("未能识别出基金代码。请明确基金代码或名称，例如：\n"
                      "- 查询 005827 净值\n- 分析易方达蓝筹\n- 110011 和 005827 对比")
             chat_history.append({"role": "assistant", "text": reply, "id": msg_id + "-r"})
-            return {"reply": reply}
+            return _reply_payload(reply, msg_id, rid)
 
         plan = build_fund_plan(intent)
         if not plan.get("steps"):
             reply = "未能为基金生成执行计划。"
             chat_history.append({"role": "assistant", "text": reply, "id": msg_id + "-r"})
-            return {"reply": reply}
+            return _reply_payload(reply, msg_id, rid)
 
         execution = execute_fund_plan(plan)
         report = generate_fund_report(execution, intent)
         chat_history.append({"role": "assistant", "text": report, "id": msg_id + "-r"})
         audit("chat.fund_reply", {"msg_id": msg_id, "content_hash": content_hash(report)},
               request_id=rid)
-        return {"reply": report}
+        return _reply_payload(report, msg_id, rid)
 
     except Exception as e:
         reply = f"处理基金请求时出现异常：{str(e)}"
         chat_history.append({"role": "assistant", "text": reply, "id": msg_id + "-r"})
         audit("chat.fund_error", {"msg_id": msg_id, "error": str(e)}, request_id=rid)
-        return {"reply": reply}
+        return _reply_payload(reply, msg_id, rid)
 
 
 # ── SSE 流式：股票 ───────────────────────────────────────────
 
 async def _stream_chat(user_input: str, history: list[dict] = None,
-                       pre_resolved_intent: dict = None):
-    """SSE 事件流生成器：逐步解析 → 获取数据 → 生成报告"""
+                       pre_resolved_intent: dict = None,
+                       rid: str = "", msg_id: str = ""):
+    """SSE 事件流生成器：逐步解析 → 获取数据 → 生成报告。
+
+    done 事件带回 msg_id / request_id：流式文本本身没有可关联的 id，
+    前端拿不到就无法提交可归因的反馈。
+    """
+    done = _assistant_ids(msg_id, rid)
     try:
         if pre_resolved_intent:
             intent = pre_resolved_intent
@@ -247,7 +264,7 @@ async def _stream_chat(user_input: str, history: list[dict] = None,
                         user_input=user_input,
                     ))
                     yield sse_event("token", {"text": build_question(ambiguous)})
-                    yield sse_event("done", {})
+                    yield sse_event("done", done)
                     return
 
         try:
@@ -259,7 +276,7 @@ async def _stream_chat(user_input: str, history: list[dict] = None,
             yield sse_event("token", {"text": (
                 "未能识别出股票代码。请明确公司名称或股票代码，例如：\n"
                 "- 苹果公司股价\n- NVDA 最近走势\n- 分析腾讯控股")})
-            yield sse_event("done", {})
+            yield sse_event("done", done)
             return
 
         # ── 2. 任务规划 ──
@@ -352,11 +369,11 @@ async def _stream_chat(user_input: str, history: list[dict] = None,
             report = await _run_sync(generate_report, execution_summary, intent, history=history)
             yield sse_event("token", {"text": report})
 
-        yield sse_event("done", {})
+        yield sse_event("done", done)
 
     except Exception as e:
         yield sse_event("error", {"message": str(e)})
-        yield sse_event("done", {})
+        yield sse_event("done", done)
 
 
 @router.post("/stream")
@@ -387,7 +404,7 @@ async def chat_stream(user_input: str = Form(...)):
 
             async def _question_stream():
                 yield sse_event("token", {"text": reply})
-                yield sse_event("done", {})
+                yield sse_event("done", _assistant_ids(msg_id, rid))
 
             return StreamingResponse(_question_stream(), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache",
@@ -395,7 +412,8 @@ async def chat_stream(user_input: str = Form(...)):
                                               "X-Accel-Buffering": "no"})
 
     return StreamingResponse(
-        _stream_chat(user_input, history=context_history, pre_resolved_intent=pre_resolved),
+        _stream_chat(user_input, history=context_history, pre_resolved_intent=pre_resolved,
+                     rid=rid, msg_id=msg_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
                  "X-Accel-Buffering": "no"},
@@ -404,8 +422,9 @@ async def chat_stream(user_input: str = Form(...)):
 
 # ── SSE 流式：基金 ───────────────────────────────────────────
 
-async def _stream_fund_chat(user_input: str):
+async def _stream_fund_chat(user_input: str, rid: str = "", msg_id: str = ""):
     """SSE 事件流生成器：基金意图解析 → 数据获取 → 报告生成"""
+    done = _assistant_ids(msg_id, rid)
     try:
         yield sse_event("status", {"message": "正在识别基金意图..."})
         intent = await _run_sync(parse_fund_intent, user_input)
@@ -418,14 +437,14 @@ async def _stream_fund_chat(user_input: str):
             yield sse_event("token", {"text": (
                 "未能识别出基金代码。请明确基金代码或名称，例如：\n"
                 "- 查询 005827 净值\n- 分析易方达蓝筹\n- 110011 和 005827 对比")})
-            yield sse_event("done", {})
+            yield sse_event("done", done)
             return
 
         yield sse_event("status", {"message": "正在制定基金数据获取计划..."})
         plan = await _run_sync(build_fund_plan, intent)
         if not plan.get("steps"):
             yield sse_event("token", {"text": "未能为基金生成执行计划。"})
-            yield sse_event("done", {})
+            yield sse_event("done", done)
             return
 
         steps = plan["steps"]
@@ -442,11 +461,11 @@ async def _stream_fund_chat(user_input: str):
         async for token in _iter_fund_stream_tokens(execution, intent):
             yield token
 
-        yield sse_event("done", {})
+        yield sse_event("done", done)
 
     except Exception as e:
         yield sse_event("error", {"message": str(e)})
-        yield sse_event("done", {})
+        yield sse_event("done", done)
 
 
 async def _iter_fund_stream_tokens(execution: dict, intent: dict):
@@ -480,7 +499,7 @@ async def chat_fund_stream(user_input: str = Form(...)):
     chat_history.append({"role": "user", "text": user_input, "id": msg_id})
     audit("chat.fund_stream", {"input": user_input[:500], "msg_id": msg_id}, request_id=rid)
     return StreamingResponse(
-        _stream_fund_chat(user_input),
+        _stream_fund_chat(user_input, rid=rid, msg_id=msg_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
                  "X-Accel-Buffering": "no"},

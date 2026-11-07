@@ -26,7 +26,7 @@ from app.compliance.rules import check_advice, content_hash
 from app.report.fonts import reportlab_fonts
 from app.report.markdown import (
     _RATIOS_MAIN, _RATIO_LABELS, _fmt_ratio, _latest,
-    _series, _fmt_cap, _trend,
+    _series, _fmt_cap, _trend, pe_percentile_scope,
 )
 
 A4_W, A4_H = A4
@@ -170,7 +170,8 @@ def _num(v, default: float | None = None) -> float | None:
         return default
 
 
-def _section_financial(story, st, fa: dict, charts: dict | None = None):
+def _section_financial(story, st, fa: dict, charts: dict | None = None,
+                       pricing: dict | None = None):
     ratios = fa.get("ratios", {})
     all_periods = fa.get("periods", []) or []
     story.append(Paragraph("二、财务分析", st["h1"]))
@@ -260,7 +261,8 @@ def _section_financial(story, st, fa: dict, charts: dict | None = None):
         story.append(Spacer(1, 4))
         story.append(Paragraph(
             f"估值分位（近似）: 当前 PE {vc.get('current_pe')} 处于历史区间"
-            f"第 {vc['pe_percentile'] * 100:.0f}% 分位。{vc.get('note') or ''}", st["small"]))
+            f"第 {vc['pe_percentile'] * 100:.0f}% 分位"
+            f"{pe_percentile_scope(vc, pricing)}。{vc.get('note') or ''}", st["small"]))
 
     # Phase 2：杜邦分解可视化（报告 PNG）
     if charts and charts.get("dupont"):
@@ -338,37 +340,45 @@ def _section_valuation(story, st, result: dict, va: dict, sotp: dict,
 
     if sotp and sotp.get("segments"):
         pl, ph = sotp.get("per_share_low"), sotp.get("per_share_high")
+        # 缺现价时摊不到每股，但分部表本身有值；不能因为算不出 per-share
+        # 就把整张表连同「模型估计」的声明一起吞掉。
+        story.append(Spacer(1, 6))
         if pl is not None and ph is not None:
-            story.append(Spacer(1, 6))
             story.append(Paragraph(f"SOTP 分部估值区间: {currency} {pl:,.2f} ~ {ph:,.2f}", st["h2"]))
-            rows = [[Paragraph(x, st["th"]) for x in ("分部", "类型", "收入占比", "净利润占比", "低估值", "高估值")]]
-            for seg in sotp.get("segments", []):
-                rs = _num(seg.get("revenue_share"))
-                ns = _num(seg.get("net_income_share"))
-                vl = _num(seg.get("value_low"))
-                vh = _num(seg.get("value_high"))
-                rs_s = f"{rs * 100:.0f}%" if rs is not None else "—"
-                ns_s = f"{ns * 100:.0f}%" if ns is not None else "—"
-                vl_s = f"{currency} {vl / 1e9:,.1f}B" if vl is not None else "—"
-                vh_s = f"{currency} {vh / 1e9:,.1f}B" if vh is not None else "—"
-                rows.append([Paragraph(_escape(seg.get("name", "?")), st["tdl"]),
-                             Paragraph(_escape(seg.get("segment_type") or "—"), st["td"]),
-                             Paragraph(rs_s, st["td"]),
-                             Paragraph(ns_s, st["td"]),
-                             Paragraph(vl_s, st["td"]),
-                             Paragraph(vh_s, st["td"])])
-            story.append(Table(rows, repeatRows=1, style=_table_style(*_st_fonts(st))))
+        else:
+            story.append(Paragraph("SOTP 分部估值", st["h2"]))
+        rows = [[Paragraph(x, st["th"]) for x in ("分部", "类型", "收入占比", "净利润占比", "低估值", "高估值")]]
+        for seg in sotp.get("segments", []):
+            rs = _num(seg.get("revenue_share"))
+            ns = _num(seg.get("net_income_share"))
+            vl = _num(seg.get("value_low"))
+            vh = _num(seg.get("value_high"))
+            rs_s = f"{rs * 100:.0f}%" if rs is not None else "—"
+            ns_s = f"{ns * 100:.0f}%" if ns is not None else "—"
+            vl_s = f"{currency} {vl / 1e9:,.1f}B" if vl is not None else "—"
+            vh_s = f"{currency} {vh / 1e9:,.1f}B" if vh is not None else "—"
+            rows.append([Paragraph(_escape(seg.get("name", "?")), st["tdl"]),
+                         Paragraph(_escape(seg.get("segment_type") or "—"), st["td"]),
+                         Paragraph(rs_s, st["td"]),
+                         Paragraph(ns_s, st["td"]),
+                         Paragraph(vl_s, st["td"]),
+                         Paragraph(vh_s, st["td"])])
+        story.append(Table(rows, repeatRows=1, style=_table_style(*_st_fonts(st))))
+        # 占比是模型拆的，不是披露值。不标这一句，读者会把估算当财报口径。
+        story.append(Paragraph("注：分部占比为模型估计，非公司披露口径。", st["body"]))
 
 
 def _section_market(story, st, ma: dict, comp: dict):
     story.append(Paragraph("四、市场与竞争", st["h1"]))
     bullets = []
-    ms = ma.get("market_share")
-    if ms is not None:
-        bullets.append(f"全球市场份额: {ms * 100:.1f}%")
     conc = ma.get("industry_concentration") or {}
     cr3, cr5, hhi = _num(conc.get("cr3")), _num(conc.get("cr5")), _num(conc.get("hhi"))
-    if any(v is not None for v in (cr3, cr5, hhi)):
+    has_conc = any(v is not None for v in (cr3, cr5, hhi))
+    ms = ma.get("market_share")
+    if ms is not None:
+        label = "市场份额" if has_conc else "份额（已知同业样本内）"
+        bullets.append(f"{label}: {ms * 100:.1f}%")
+    if has_conc:
         parts = []
         if cr3 is not None:
             parts.append(f"CR3 {cr3 * 100:.1f}%")
@@ -377,6 +387,8 @@ def _section_market(story, st, ma: dict, comp: dict):
         if hhi is not None:
             parts.append(f"HHI {hhi:.0f}")
         bullets.append("行业集中度: " + " | ".join(parts))
+    elif conc.get("note"):
+        bullets.append(f"行业集中度: {conc['note']}")
     tam = ma.get("tam_estimate")
     if tam:
         bullets.append(f"TAM 市场规模: ${tam / 1e9:,.0f}B")
@@ -387,7 +399,8 @@ def _section_market(story, st, ma: dict, comp: dict):
     if comp_data:
         story.append(Spacer(1, 4))
         story.append(Paragraph("主要竞争对手营收对比", st["h2"]))
-        rows = [[Paragraph(x, st["th"]) for x in ("公司", "营收 (USD)", "份额")]]
+        share_head = "份额" if has_conc else "份额（样本内）"
+        rows = [[Paragraph(x, st["th"]) for x in ("公司", "营收 (USD)", share_head)]]
         for c in comp_data[:8]:
             rev = _num(c.get("revenue"))
             share = _num(c.get("share"))
@@ -452,11 +465,13 @@ def _section_risk(story, st, geo: dict, sc: dict, fc: dict):
             name = ev.get("event") or ev.get("name")
             region = ev.get("region") or "—"
             prob = ev.get("probability") or "—"
-            story.append(Paragraph(f"• <b>{_escape(name)}</b>（{_escape(region)}，概率 {_escape(prob)}）", st["body"]))
+            story.append(Paragraph(f"• <b>{_escape(name)}</b>（{_escape(region)}，概率 {_escape(prob)}，模型推断）", st["body"]))
             if ev.get("impact"):
                 story.append(Paragraph(f"  影响: {_escape(ev['impact'])}", st["body"]))
             if ev.get("transmission_path"):
                 story.append(Paragraph(f"  传导: {_escape(ev['transmission_path'])}", st["body"]))
+        # 事件与概率都是模型推演，何况常带未来年份。不标出来会被当成既成事实读。
+        story.append(Paragraph("注：以上地缘事件及其概率为模型情景推演，非事实陈述。", st["body"]))
     if isinstance(sc, dict):
         sc_sum = sc.get("summary")
         sup_conc = sc.get("supplier_concentration")
@@ -617,7 +632,7 @@ def result_to_pdf(result: dict, charts: dict | None = None, output_path: str = "
 
     _section_summary(story, st, result, fa, va, swot)
     story.append(PageBreak())
-    _section_financial(story, st, fa, charts)
+    _section_financial(story, st, fa, charts, result.get("pricing"))
     story.append(Spacer(1, 10))
     _section_valuation(story, st, result, va, sotp, charts)
     story.append(PageBreak())

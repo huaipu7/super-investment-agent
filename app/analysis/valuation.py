@@ -8,7 +8,7 @@ from typing import Optional
 
 from app.utils.logger import logger
 from app.analysis.industry import IndustryClass, get_avg_multiples
-from app.analysis.estimates import make_estimate
+from app.analysis.estimates import FALLBACK_RF, make_estimate
 
 # 各行业股权风险溢价（ERP）估计
 INDUSTRY_ERP: dict[IndustryClass, float] = {
@@ -79,6 +79,65 @@ DEFAULT_TERMINAL_GROWTH = 0.03
 # 显式预测期年数
 DEFAULT_PROJECTION_YEARS = 5
 
+# WACC 与永续增长率的最小差距。低于 2pp 时分母 (WACC − g) 趋近于零，终端价值被
+# 放大成数学产物而非经济判断——曾出现 WACC 3.17% / g 3% → 内在价值为现价 51 倍。
+MIN_WACC_GROWTH_SPREAD = 0.02
+
+# 每股内在价值 / 现价 的可接受倍数区间。越界说明参数或输入失真（ERP 触底、
+# WACC 偏离、FCF 口径错误），结果不予采用，显式降级并说明原因。
+FAIR_VALUE_PRICE_BAND = (0.3, 3.0)
+
+
+def band_degrade_reason(fair_value: float, price: float, ratio: float) -> str:
+    """每股价值与现价背离过远时的降级说明（分析与增量刷新共用同一措辞）。"""
+    lo, hi = FAIR_VALUE_PRICE_BAND
+    return (f"DCF 每股价值 {fair_value:,.2f} 为现价 {price:,.2f} 的 {ratio:.2f} 倍，"
+            f"超出合理区间 [{lo}, {hi}]，参数或输入失真，结果不予采用")
+
+
+def build_valuation_summary(
+    dcf: Optional[dict],
+    relative_valuation: Optional[dict],
+    current_price: Optional[float],
+    supply_chain_premium: float = 0.0,
+) -> str:
+    """估值摘要文本。
+
+    全量分析与增量刷新共用同一口径：刷新时只换了价格和空间，摘要必须跟着重算，
+    否则报告正文写着旧空间、字段里是新数字。
+    """
+    summary_parts = []
+    dcf = dcf if isinstance(dcf, dict) else {}
+    if dcf.get("fair_value") is not None:
+        fv = dcf["fair_value"]
+        upside = dcf.get("upside")
+        if upside is not None:
+            label = "高估" if upside < -0.1 else "低估" if upside > 0.15 else "合理"
+            summary_parts.append(
+                f"DCF 内在价值 ${fv:.2f}，"
+                f"当前价格 {'$' + str(current_price) if current_price else 'N/A'}，"
+                f"{label}（空间 {upside:+.1%}）")
+        else:
+            summary_parts.append(f"DCF 内在价值 ${fv:.2f}")
+    elif dcf.get("reason"):
+        summary_parts.append(f"DCF 不可用：{dcf['reason']}")
+    else:
+        summary_parts.append("DCF 不适用（FCF 不足或为负）")
+
+    rel = relative_valuation if isinstance(relative_valuation, dict) else {}
+    premiums = [
+        f"{mk.upper()} {entry['premium']:+.1%}"
+        for mk, entry in rel.items()
+        if isinstance(entry, dict) and entry.get("premium") is not None
+    ]
+    if premiums:
+        summary_parts.append("相对估值: " + "，".join(premiums))
+
+    summary = "；".join(summary_parts)
+    if supply_chain_premium > 0:
+        summary += f"；供应链风险溢价 {supply_chain_premium * 100:.2f}%"
+    return summary
+
 
 class DCFModel:
     """DCF 估值模型"""
@@ -144,6 +203,21 @@ class DCFModel:
 
         if wacc <= 0 or wacc >= 1:
             return {"fair_value": None, "upside": None, "reason": f"WACC ({wacc:.2%}) 超出合理范围"}
+
+        # 分母保护：WACC 逼近永续增长率时终端价值趋于无穷，结果不是估值而是噪声
+        spread = wacc - terminal_growth
+        if spread < MIN_WACC_GROWTH_SPREAD:
+            return {
+                "fair_value": None,
+                "upside": None,
+                "degraded": True,
+                "wacc_used": wacc,
+                "terminal_growth": terminal_growth,
+                "reason": (f"WACC {wacc:.2%} 与永续增长率 {terminal_growth:.2%} "
+                           f"仅相差 {spread * 100:.2f}pp，低于 "
+                           f"{MIN_WACC_GROWTH_SPREAD * 100:.0f}pp 下限，"
+                           f"终端价值分母趋零、结果无经济意义"),
+            }
 
         latest_fcf = fcf_history[-1]
         if latest_fcf <= 0:
@@ -233,9 +307,10 @@ class DCFModel:
         lo = (steps - 1) / 2
         wacc_vals = [base_wacc + wacc_spread * (i - lo) for i in range(steps)]
         g_vals = [base_terminal_growth + growth_spread * (i - lo) for i in range(steps)]
-        # WACC 需在 (0,1) 且严格大于永续增长率，否则 compute_dcf 拒绝
+        # WACC 需在 (0,1) 且与永续增长率拉开下限差距，否则 compute_dcf 拒绝
         wacc_vals = [max(0.01, min(0.40, w)) for w in wacc_vals]
-        g_vals = [max(-0.01, min(w - 0.01, g)) for g, w in zip(g_vals, wacc_vals)]
+        g_vals = [max(-0.01, min(w - MIN_WACC_GROWTH_SPREAD, g))
+                  for g, w in zip(g_vals, wacc_vals)]
 
         matrix: list[list[float | None]] = []
         base_fv: float | None = None
@@ -402,10 +477,11 @@ class DCFModel:
         erp_est = est.get("erp")
         rfr = rf_est.get("value") if isinstance(rf_est, dict) else None
         if rfr is None:
-            from app.report_generation.pdf_generator import get_risk_free_rate
-            rfr = get_risk_free_rate()
-            rf_est = make_estimate(rfr, "yfinance ^TNX（旧路径兜底）", "medium",
-                                   "estimates 未提供无风险利率")
+            from app.analysis.estimates import get_risk_free_rate
+            rf_est = get_risk_free_rate(market="us")
+            rfr = rf_est.get("value")
+            if rfr is None:
+                rfr = FALLBACK_RF
         beta = beta_est.get("value") if isinstance(beta_est, dict) else None
         erp_v = erp_est.get("value") if isinstance(erp_est, dict) else None
         result["estimates"] = {
@@ -453,20 +529,32 @@ class DCFModel:
 
                     if shares and shares > 0 and equity_value > 0:
                         fair_value_per_share = equity_value / shares
-                        dcf_result["fair_value"] = fair_value_per_share
-                        if current_price and current_price > 0:
-                            dcf_result["upside"] = (fair_value_per_share - current_price) / current_price
-                        else:
+                        lo, hi = FAIR_VALUE_PRICE_BAND
+                        ratio = (fair_value_per_share / current_price
+                                 if current_price and current_price > 0 else None)
+                        if ratio is not None and not (lo <= ratio <= hi):
+                            # 与现价偏离超过一个量级：模型参数或输入已失真，结果不予采用
+                            dcf_result["fair_value"] = None
                             dcf_result["upside"] = None
-                        # DCF 敏感性矩阵（WACC × 永续g → 每股价值，热力图数据）
-                        try:
-                            dcf_result["sensitivity"] = self.compute_sensitivity(
-                                fcf_history, wacc,
-                                base_terminal_growth=dcf_result.get(
-                                    "terminal_growth", DEFAULT_TERMINAL_GROWTH),
-                                shares=shares, net_debt=nd_val)
-                        except Exception:
-                            pass
+                            dcf_result["degraded"] = True
+                            dcf_result["reason"] = band_degrade_reason(
+                                fair_value_per_share, current_price, ratio)
+                            logger.warning("%s", dcf_result["reason"])
+                        else:
+                            dcf_result["fair_value"] = fair_value_per_share
+                            if current_price and current_price > 0:
+                                dcf_result["upside"] = (fair_value_per_share - current_price) / current_price
+                            else:
+                                dcf_result["upside"] = None
+                            # DCF 敏感性矩阵（WACC × 永续g → 每股价值，热力图数据）
+                            try:
+                                dcf_result["sensitivity"] = self.compute_sensitivity(
+                                    fcf_history, wacc,
+                                    base_terminal_growth=dcf_result.get(
+                                        "terminal_growth", DEFAULT_TERMINAL_GROWTH),
+                                    shares=shares, net_debt=nd_val)
+                            except Exception:
+                                pass
                     else:
                         dcf_result["fair_value"] = None
                         dcf_result["upside"] = None
@@ -505,32 +593,10 @@ class DCFModel:
             result["estimates"]["industry_pe"] = peer_pe
 
         # ── 3. 文字摘要 ──
-        summary_parts = []
-        dcf = result.get("dcf", {})
-        if dcf and dcf.get("fair_value") is not None:
-            fv = dcf["fair_value"]
-            upside = dcf.get("upside")
-            if upside is not None:
-                label = "高估" if upside < -0.1 else "低估" if upside > 0.15 else "合理"
-                summary_parts.append(f"DCF 内在价值 ${fv:.2f}，当前价格 {'$' + str(current_price) if current_price else 'N/A'}，{label}（空间 {upside:+.1%}）")
-            else:
-                summary_parts.append(f"DCF 内在价值 ${fv:.2f}")
-        else:
-            summary_parts.append("DCF 不适用（FCF 不足或为负）")
-
-        rel = result.get("relative_valuation", {})
-        if rel:
-            premiums = []
-            for mk, entry in rel.items():
-                if entry.get("premium") is not None:
-                    premiums.append(f"{mk.upper()} {entry['premium']:+.1%}")
-            if premiums:
-                summary_parts.append("相对估值: " + "，".join(premiums))
-
-        result["summary"] = "；".join(summary_parts)
+        result["summary"] = build_valuation_summary(
+            result.get("dcf", {}), result.get("relative_valuation", {}),
+            current_price, sc_premium)
         result["supply_chain_risk_premium"] = round(sc_premium, 6)
-        if sc_premium > 0:
-            result["summary"] += f"；供应链风险溢价 {sc_premium*100:.2f}%"
         logger.info("估值分析完成: %s", result["summary"])
         return result
 
@@ -656,6 +722,14 @@ def recompute_dcf_from_result(
     if equity <= 0:
         return {"available": False, "reason": "企业价值小于净负债，每股价值不适用"}
     fair_value = equity / shares
+    if price and price > 0:
+        lo, hi = FAIR_VALUE_PRICE_BAND
+        ratio = fair_value / price
+        if not (lo <= ratio <= hi):
+            return {"available": False,
+                    "reason": (f"重算每股价值 {fair_value:,.2f} 为现价 {price:,.2f} 的 "
+                               f"{ratio:.2f} 倍，超出合理区间 [{lo}, {hi}]，"
+                               f"请调整 WACC / 永续增长率参数")}
     upside = (fair_value - price) / price if price and price > 0 else None
     sens = dm.compute_sensitivity(fcf_history, wacc_v,
                                   base_terminal_growth=terminal_growth,

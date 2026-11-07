@@ -14,6 +14,7 @@ from app.compliance.rules import (
     COMPLIANCE_DISCLAIMER, apply_gate, check_advice, content_hash,
 )
 from app.constants import DATA_SOURCE_DISCLAIMER
+from app.memory.context import build_memory_context
 
 
 def _find_result(results: list[dict], action: str) -> any:
@@ -48,22 +49,25 @@ REPORT_PROMPT = """你是 Violetz 投资顾问，一个专业、客观的金融�
 
 
 def _build_context_summary(history: list[dict] | None) -> str:
-    """从对话历史构建上下文摘要，注入分析 prompt"""
-    if not history:
-        return ""
+    """从长时记忆（画像/摘要）+ 对话历史构建上下文摘要，注入分析 prompt"""
+    parts: list[str] = []
 
-    user_msgs = [h["text"] for h in history if h.get("role") == "user"]
-    if not user_msgs:
-        return ""
+    memory_context = build_memory_context()
+    if memory_context:
+        parts.append(memory_context)
 
-    recent = user_msgs[-3:]
-    lines = ["6. 注意对话上下文：用户之前已查询了以下内容，请在分析时考虑连贯性"]
-    for i, text in enumerate(recent, 1):
-        # 截取过长文本
-        short = text[:60] + "..." if len(text) > 60 else text
-        lines.append(f"   {i}. {short}")
-    lines.append("     当前分析应基于以上上下文进行适当扩展，避免简单重复已提供的信息。")
-    return "\n".join(lines)
+    user_msgs = [h["text"] for h in history if h.get("role") == "user"] if history else []
+    if user_msgs:
+        recent = user_msgs[-3:]
+        lines = ["6. 注意对话上下文：用户之前已查询了以下内容，请在分析时考虑连贯性"]
+        for i, text in enumerate(recent, 1):
+            # 截取过长文本
+            short = text[:60] + "..." if len(text) > 60 else text
+            lines.append(f"   {i}. {short}")
+        lines.append("     当前分析应基于以上上下文进行适当扩展，避免简单重复已提供的信息。")
+        parts.append("\n".join(lines))
+
+    return "\n\n".join(parts)
 
 
 def _fmt_cap(cap: float, currency: str) -> str:
@@ -166,7 +170,7 @@ def _format_financials_report(fin: dict) -> str:
 def _format_analysis_report(results: list[dict], intent: str, history: list[dict] = None) -> str:
     """调用 DeepSeek 生成深度分析报告"""
     context = _build_report_context(results)
-    history_context = _build_context_summary(history) if history else ""
+    history_context = _build_context_summary(history)
 
     try:
         prompt = REPORT_PROMPT.format(
@@ -323,7 +327,7 @@ def stream_analysis_report(results: list[dict], intent: str, history: list[dict]
         yield "（报告数据不足，无法生成分析。）"
         return
 
-    history_context = _build_context_summary(history) if history else ""
+    history_context = _build_context_summary(history)
     data_json = json.dumps(context, ensure_ascii=False, indent=2)
     prompt = REPORT_PROMPT.format(
         data_json=data_json,

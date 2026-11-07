@@ -5,7 +5,8 @@
 确定性：同一输入 → 同一输出；网络失败返回 fallback 估算并标注来源，不抛异常。
 
 涉及输入：
-- 无风险利率：A股 → akshare 中国 10 年期国债收益率；美股 → yfinance ^TNX。
+- 无风险利率：A股 → akshare 中国 10 年期国债收益率；美股/港股 → 美国财政部
+  官方每日曲线的 10Y（回退 akshare 汇总的美国 10 年期）。
 - Beta：个股 5y 日收益对基准指数（A股沪深300 / 美股标普500 / 港股恒指）OLS 回归。
 - ERP：基准指数长期年化收益 − 无风险利率，夹到 [0.02, 0.09]；不足回退行业常量。
 - 行业 PE：竞品集合真实 trailing PE 的中位数（n≥3 才 high 置信）。
@@ -32,44 +33,87 @@ def make_estimate(value, source: str, confidence: str,
     }
 
 
-def get_risk_free_rate(ashare: bool = False) -> dict:
-    """真实无风险利率：A股用中国 10 年期国债，美股用美国 10Y(^TNX)。
+def _cn_10y_akshare() -> tuple[float, str, str]:
+    """中国 10 年期国债收益率（akshare 汇总的中债数据）。"""
+    import akshare as ak
+    df = ak.bond_zh_us_rate(start_date="20240101")
+    col = next((c for c in df.columns if "中国" in str(c) and "10年" in str(c)), None)
+    if col is None:
+        raise ValueError("akshare 债券数据无中国10年期收益率列")
+    s = pd.to_numeric(df[col], errors="coerce").dropna()
+    if s.empty:
+        raise ValueError("akshare 中国10年期收益率无有效值")
+    rate = float(s.iloc[-1]) / 100.0
+    if not (0.0 < rate < 0.15):
+        raise ValueError(f"中国10年期收益率超出合理范围: {rate}")
+    # 日期取「日期」列：默认 RangeIndex 是行号，取它会写出「数据日期 7117」这种假日期
+    obs = str(df.loc[s.index[-1], "日期"])[:10] if "日期" in df.columns else ""
+    return rate, f"akshare bond_zh_us_rate {col}", obs
 
-    网络/数据失败 → 回退 FALLBACK_RF 并标注来源，不静默。
+
+def _us_10y_treasury() -> tuple[float, str, str]:
+    """美国财政部每日收益率曲线 10Y（官方、零 key、可按日回溯）。"""
+    from app.data.sources.treasury_source import TreasurySource
+    df = TreasurySource().fetch_yield_curve(months=3)
+    if df is None or df.empty or "10 Yr" not in df.columns:
+        raise ValueError("Treasury 曲线无 10 Yr 列")
+    s = pd.to_numeric(df["10 Yr"], errors="coerce").dropna()
+    if s.empty:
+        raise ValueError("Treasury 10 Yr 无有效值")
+    rate = float(s.iloc[-1]) / 100.0
+    if not (0.0 < rate < 0.15):
+        raise ValueError(f"美国10年期收益率超出合理范围: {rate}")
+    return rate, "US Treasury 每日收益率曲线 10 Yr（官方）", str(s.index[-1])[:10]
+
+
+def _us_10y_akshare() -> tuple[float, str, str]:
+    """同上，经 akshare 汇总的美国 10 年期，Treasury 不可达时的第二通路。"""
+    import akshare as ak
+    df = ak.bond_zh_us_rate(start_date="20240101")
+    col = next((c for c in df.columns if "美国" in str(c) and "10年" in str(c)), None)
+    if col is None:
+        raise ValueError("akshare 债券数据无美国10年期收益率列")
+    s = pd.to_numeric(df[col], errors="coerce").dropna()
+    if s.empty:
+        raise ValueError("akshare 美国10年期收益率无有效值")
+    rate = float(s.iloc[-1]) / 100.0
+    if not (0.0 < rate < 0.15):
+        raise ValueError(f"美国10年期收益率超出合理范围: {rate}")
+    obs = str(df.loc[s.index[-1], "日期"])[:10] if "日期" in df.columns else ""
+    return rate, f"akshare bond_zh_us_rate {col}", obs
+
+
+def get_risk_free_rate(ashare: bool = False, market: str | None = None) -> dict:
+    """真实无风险利率：cn → 中国 10 年期国债；us/hk → 美国 10 年期国债。
+
+    美国侧走两级真实通路（财政部官方曲线 → akshare 汇总），两条都失败才回退
+    FALLBACK_RF 并写明失败原因。港股现金流以港币计价、港币与美元挂钩，用美国
+    利率近似并在 note 里说明——这是近似，不是香港本地利率，不能默默替换。
     """
-    try:
-        if ashare:
-            import akshare as ak
-            df = ak.bond_zh_us_rate(start_date="20000101")
-            col = None
-            for c in df.columns:
-                if "中国" in str(c) and "10年" in str(c):
-                    col = c
-                    break
-            if col is None:
-                raise ValueError("akshare 债券数据无中国10年期收益率列")
-            s = pd.to_numeric(df[col], errors="coerce").dropna()
-            if s.empty:
-                raise ValueError("akshare 中国10年期收益率无有效值")
-            rate = float(s.iloc[-1]) / 100.0
-            if not (0.0 < rate < 0.15):
-                raise ValueError(f"中国10年期收益率超出合理范围: {rate}")
-            return make_estimate(round(rate, 6),
-                                 "akshare bond_zh_us_rate 中国10年期国债收益率", "high",
-                                 f"数据日期 {str(df.index[-1])[:10]}")
-        else:
-            import yfinance as yf
-            info = yf.Ticker("^TNX").history(period="1d")
-            if info.empty:
-                raise ValueError("yfinance ^TNX 无数据")
-            rate = float(info["Close"].iloc[-1]) / 100.0
-            if not (0.0 < rate < 0.15):
-                raise ValueError(f"美国10年期收益率超出合理范围: {rate}")
-            return make_estimate(round(rate, 6), "yfinance ^TNX 美国10年期国债", "high")
-    except Exception as e:
-        logger.warning("无风险利率拉取失败(%s)，回退常量 %s", e, FALLBACK_RF)
-        return make_estimate(FALLBACK_RF, f"fallback常量（免费源不可用: {e}）", "low",
-                             "无真实利率数据，使用长期均值近似")
+    mkt = (market or ("cn" if ashare else "us")).lower()
+    errors: list[str] = []
+    if mkt == "cn":
+        try:
+            rate, src, obs = _cn_10y_akshare()
+            return make_estimate(round(rate, 6), src, "high", f"数据日期 {obs}")
+        except Exception as e:
+            errors.append(f"akshare 中国10年期: {e}")
+    else:
+        for label, fetch in (("US Treasury 官方曲线", _us_10y_treasury),
+                             ("akshare 美国10年期", _us_10y_akshare)):
+            try:
+                rate, src, obs = fetch()
+                note = f"数据日期 {obs}"
+                if mkt == "hk":
+                    note += "；港币与美元挂钩（联系汇率），以美国10年期近似港币无风险利率"
+                return make_estimate(round(rate, 6), src,
+                                     "medium" if mkt == "hk" else "high", note)
+            except Exception as e:
+                errors.append(f"{label}: {e}")
+    detail = "; ".join(errors) or "未知原因"
+    logger.warning("无风险利率拉取失败(%s)，回退常量 %s", detail, FALLBACK_RF)
+    return make_estimate(FALLBACK_RF, f"fallback常量（免费源不可用: {detail}）", "low",
+                         "无真实利率数据，使用长期均值近似")
 
 
 def compute_beta(price_data, benchmark_df) -> dict:

@@ -1,6 +1,12 @@
-"""策划车间 - 任务分解与路径规划（逐字迁移自 workshops/planner.py）"""
+"""策划车间 - 任务分解与路径规划（逐字迁移自 workshops/planner.py）
 
+模板覆盖不到的请求（没识别出标的、或意图来自规则兜底）走一次 LLM 排步骤；
+LLM 排出的步骤仍必须落在 `runner.ACTION_MAP` 白名单内，否则整条丢弃。
+同一 (意图, 原文 hash) 只问一次模型——重复提问不重复烧 token。
+"""
+import hashlib
 import json
+import re
 
 # ===== 各意图对应的默认时间范围 =====
 DEFAULT_TIMEFRAME = {
@@ -22,6 +28,12 @@ _KNOWN_ACTIONS = {
 def build_plan(intent_result: dict) -> dict:
     """根据意图解析结果生成可执行计划
 
+    模板优先，但以下两种情况下先问一次 LLM 排步骤（确定性分支原样保留，
+    LLM 不可用或排不出合法步骤就退回模板，行为与改动前一致）：
+
+      * 没识别出标的 —— 模板只会返回「未能识别股票代码」的死胡同；
+      * 意图来自规则兜底（`confidence == "low"`）—— 靠关键词猜的，不可信。
+
     Args:
         intent_result: intent.parse() 的输出
 
@@ -32,6 +44,15 @@ def build_plan(intent_result: dict) -> dict:
             "meta": {"intent": str, "tickers": list}
         }
     """
+    if _needs_llm_plan(intent_result):
+        llm_plan = _try_llm_plan(intent_result)
+        if llm_plan:
+            return llm_plan
+    return _build_deterministic(intent_result)
+
+
+def _build_deterministic(intent_result: dict) -> dict:
+    """模板分支。改动前后逐字一致——B2 只在它前面加了一层兜底。"""
     intent = intent_result["intent"]
     tickers = intent_result["tickers"]
     timeframe = intent_result.get("timeframe") or DEFAULT_TIMEFRAME.get(intent)
@@ -235,3 +256,142 @@ def _try_llm_steps(tickers: list[str], timeframe: str) -> dict | None:
                          "planner": "llm"},
             }
     return None
+
+
+# ── 模板外兜底：LLM 排步骤（B2）────────────────────────────────
+#
+# 三条纪律：
+#   1. 只在模板确实无解时触发（没标的 / 规则兜底的意图），不覆盖已验证的确定性分支；
+#   2. 排出来的每一步都必须能落到 runner.ACTION_MAP，标的不合法的步骤整条丢弃；
+#   3. 一条都留不下就当没发生过，调用方拿到的还是原来那份模板计划。
+
+_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-^=]{0,11}$")
+
+# (意图, 原文 hash) → 计划。进程内缓存：同一句话问第二次不再花 token。
+_PLAN_CACHE: dict[tuple[str, str], dict] = {}
+
+PLAN_REQUEST_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "build_execution_plan",
+        "description": ("为用户的投资查询排出可执行步骤。每个步骤只能调用给定的数据工具，"
+                        "且必须指定标的。排不出可执行步骤就不要调用本工具。"),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": sorted(_KNOWN_ACTIONS)},
+                            "ticker": {"type": "string",
+                                       "description": "如 AAPL / 0700.HK / 600519.SS"},
+                            "period": {"type": "string",
+                                       "description": "仅 get_history 需要，如 1mo / 1y / 5y"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["action", "ticker"],
+                    },
+                }
+            },
+            "required": ["steps"],
+        },
+    },
+}
+
+
+def _needs_llm_plan(intent_result: dict) -> bool:
+    """模板无解的两个真实信号：没有标的，或意图是规则兜底猜出来的。"""
+    if not (intent_result.get("tickers") or []):
+        return True
+    return str(intent_result.get("confidence") or "").strip().lower() == "low"
+
+
+def _plan_key(intent_result: dict) -> tuple[str, str]:
+    text = str(intent_result.get("raw_input") or "")
+    return (str(intent_result.get("intent") or ""),
+            hashlib.sha1(text.encode("utf-8")).hexdigest()[:16])
+
+
+def clear_plan_cache() -> None:
+    _PLAN_CACHE.clear()
+
+
+def plan_cache_stats() -> dict:
+    return {"size": len(_PLAN_CACHE), "keys": sorted(k[0] for k in _PLAN_CACHE)}
+
+
+def _try_llm_plan(intent_result: dict) -> dict | None:
+    """让模型排一次步骤。不可用 / 排不合法 / 全被丢弃 → None（走模板）。"""
+    key = _plan_key(intent_result)
+    cached = _PLAN_CACHE.get(key)
+    if cached is not None:
+        return {**cached, "meta": {**cached["meta"], "cache": "hit"}}
+
+    text = str(intent_result.get("raw_input") or "").strip()
+    if not text:
+        return None
+
+    try:
+        from app.agent.llm import chat_tool_calls
+
+        calls = chat_tool_calls(
+            messages=[
+                {"role": "system", "content":
+                    "你是投资任务规划器。只返回可执行的数据获取步骤，不要复述用户问题，"
+                    "不要编造标的。"},
+                {"role": "user", "content":
+                    f"用户请求：{text}\n"
+                    f"当前粗解析：意图={intent_result.get('intent')}，"
+                    f"标的={intent_result.get('tickers') or []}。"},
+            ],
+            tools=[PLAN_REQUEST_TOOL],
+            task="plan",
+        )
+    except Exception:  # noqa: BLE001 LLM 不可用 → 维持模板行为
+        return None
+    if not calls:
+        return None
+
+    for tc in calls:
+        if tc.get("name") != "build_execution_plan":
+            continue
+        try:
+            raw_steps = json.loads(tc.get("arguments") or "{}").get("steps") or []
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        steps = _sanitize_steps(raw_steps)
+        if not steps:
+            continue
+        plan = {
+            "steps": steps,
+            "parallel_groups": [list(range(len(steps)))],
+            "meta": {"intent": intent_result.get("intent"), "tickers":
+                     sorted({s["params"]["ticker"] for s in steps}),
+                     "planner": "llm-fallback", "cache": "miss"},
+        }
+        _PLAN_CACHE[key] = plan
+        return plan
+    return None
+
+
+def _sanitize_steps(raw_steps) -> list[dict]:
+    """白名单过滤：动作不在 ACTION_MAP、标的格式不对的步骤整条丢掉。"""
+    from app.agent.runner import ACTION_MAP
+
+    steps: list[dict] = []
+    for s in raw_steps:
+        if not isinstance(s, dict):
+            continue
+        action = str(s.get("action") or "").strip()
+        ticker = str(s.get("ticker") or "").strip().upper()
+        if action not in ACTION_MAP or not _TICKER_RE.match(ticker):
+            continue
+        params: dict = {"ticker": ticker}
+        period = str(s.get("period") or "").strip()
+        if action == "get_history" and period:
+            params["period"] = period
+        desc = str(s.get("description") or "").strip() or f"{action}({ticker})"
+        steps.append(_step(action, params, desc))
+    return steps

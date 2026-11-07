@@ -129,8 +129,11 @@ def _section_summary(result: dict, fa: dict, va: dict, swot: dict) -> list[str]:
     dcf = va.get("dcf") if isinstance(va.get("dcf"), dict) else None
     rel = va.get("relative_valuation") if isinstance(va.get("relative_valuation"), dict) else None
     if dcf and dcf.get("fair_value") is not None:
-        lines.append(f"- **DCF 内在价值**: {currency} {dcf['fair_value']:,.2f}"
-                     f"（upside {dcf.get('upside') * 100:+.1f}%）")
+        # upside 可能没有：缺现价（或现价是 NaN）时算不出来。缺就标 —，
+        # 不能假设它一定存在，否则整份报告渲染就崩在这一个数上。
+        up = _num(dcf.get("upside"))
+        tail = f"（upside {up * 100:+.1f}%）" if up is not None else "（upside —，缺现价）"
+        lines.append(f"- **DCF 内在价值**: {currency} {dcf['fair_value']:,.2f}{tail}")
     if rel and rel.get("pe"):
         pe = rel["pe"]
         pe_c, pe_a = _num(pe.get("company")), _num(pe.get("industry_avg"))
@@ -144,6 +147,10 @@ def _section_summary(result: dict, fa: dict, va: dict, swot: dict) -> list[str]:
     rating = swot.get("rating") if isinstance(swot, dict) else None
     if rating:
         lines.append(f"- **SWOT 综合评级**: {rating}")
+    elif isinstance(swot, dict) and swot.get("degraded"):
+        # 不写出来会让人以为「没评级 = 没这项」，实际是没生成成功
+        reason = swot.get("reason") or "LLM 未返回有效结果"
+        lines.append(f"- **SWOT 综合评级**: 未生成（{reason}）")
     if result.get("pipeline_time"):
         lines.append(f"- **管线耗时**: {result['pipeline_time']:.1f}s")
 
@@ -157,7 +164,38 @@ def _section_summary(result: dict, fa: dict, va: dict, swot: dict) -> list[str]:
 _MAX_PERIODS = 8
 
 
-def _section_financial(fa: dict) -> list[str]:
+def pe_percentile_scope(vc: dict, pricing: dict | None) -> str:
+    """分位句里的口径括注：样本年份 + 算这个分位时的现价日期。
+
+    两者都拿不到时返回空串（退化为改动前的写法，不写「—」占位）。刷新产物里
+    分位可能比现价旧，这时必须把两个日期都说出来，否则读者会把旧分位当今日值。
+    """
+    periods = vc.get("hist_pe_periods")
+    span = ""
+    if (isinstance(periods, list) and periods
+            and all(isinstance(p, str) and p for p in periods)):
+        span = (f"样本 {periods[0]}" + (f"–{periods[-1]}" if len(periods) > 1 else "")
+                + " 年度均价")
+
+    price_as_of = pricing.get("price_as_of") if isinstance(pricing, dict) else None
+    if not isinstance(price_as_of, str) or not price_as_of:
+        price_as_of = None
+    pct_as_of = vc.get("pe_percentile_as_of")
+    if not isinstance(pct_as_of, str) or not pct_as_of:
+        pct_as_of = price_as_of
+
+    if pct_as_of and price_as_of and pct_as_of != price_as_of:
+        date_part = f"该分位按 {pct_as_of} 收盘价计算，现价已更新至 {price_as_of}"
+    elif pct_as_of:
+        date_part = f"现价截至 {pct_as_of}"
+    else:
+        date_part = ""
+
+    bits = [b for b in (span, date_part) if b]
+    return f"（{'；'.join(bits)}）" if bits else ""
+
+
+def _section_financial(fa: dict, pricing: dict | None = None) -> list[str]:
     ratios = fa.get("ratios", {})
     all_periods = fa.get("periods", []) or []
     lines = ["## 二、财务分析", ""]
@@ -251,8 +289,9 @@ def _section_financial(fa: dict) -> list[str]:
     # 估值历史分位（近似，显式标注）
     vc = fa.get("valuation_context") or {}
     if vc.get("pe_percentile") is not None:
+        scope = pe_percentile_scope(vc, pricing)
         lines.append(f"> 估值分位（近似）: 当前 PE {vc.get('current_pe')} 处于历史区间"
-                     f"第 {vc['pe_percentile'] * 100:.0f}% 分位。{vc.get('note') or ''}")
+                     f"第 {vc['pe_percentile'] * 100:.0f}% 分位{scope}。{vc.get('note') or ''}")
         lines.append("")
     lines.append("")
     return lines
@@ -338,34 +377,39 @@ def _section_valuation(result: dict, va: dict, sotp: dict) -> list[str]:
 
     if sotp and sotp.get("segments"):
         pl, ph = sotp.get("per_share_low"), sotp.get("per_share_high")
+        # 缺现价时摊不到每股，但分部表本身有值；不能因为算不出 per-share
+        # 就把整张表连同「模型估计」的声明一起吞掉。
         if pl is not None and ph is not None:
             lines += ["", f"**SOTP 分部估值区间**: {currency} {pl:,.2f} ~ {ph:,.2f}"]
-            lines += ["", "| 分部 | 类型 | 收入占比 | 净利润占比 | 低估值 | 高估值 |",
-                      "| --- | --- | ---: | ---: | ---: | ---: |"]
-            for seg in sotp.get("segments", []):
-                rs = _num(seg.get("revenue_share"))
-                ns = _num(seg.get("net_income_share"))
-                vl = _num(seg.get("value_low"))
-                vh = _num(seg.get("value_high"))
-                rs_s = f"{rs * 100:.0f}%" if rs is not None else "—"
-                ns_s = f"{ns * 100:.0f}%" if ns is not None else "—"
-                vl_s = f"{currency} {vl / 1e9:,.1f}B" if vl is not None else "—"
-                vh_s = f"{currency} {vh / 1e9:,.1f}B" if vh is not None else "—"
-                lines.append(f"| {seg.get('name', '?')} | {seg.get('segment_type') or '—'} | "
-                             f"{rs_s} | {ns_s} | {vl_s} | {vh_s} |")
-            lines.append("")
+        lines += ["", "| 分部 | 类型 | 收入占比 | 净利润占比 | 低估值 | 高估值 |",
+                  "| --- | --- | ---: | ---: | ---: | ---: |"]
+        for seg in sotp.get("segments", []):
+            rs = _num(seg.get("revenue_share"))
+            ns = _num(seg.get("net_income_share"))
+            vl = _num(seg.get("value_low"))
+            vh = _num(seg.get("value_high"))
+            rs_s = f"{rs * 100:.0f}%" if rs is not None else "—"
+            ns_s = f"{ns * 100:.0f}%" if ns is not None else "—"
+            vl_s = f"{currency} {vl / 1e9:,.1f}B" if vl is not None else "—"
+            vh_s = f"{currency} {vh / 1e9:,.1f}B" if vh is not None else "—"
+            lines.append(f"| {seg.get('name', '?')} | {seg.get('segment_type') or '—'} | "
+                         f"{rs_s} | {ns_s} | {vl_s} | {vh_s} |")
+        # 占比是模型拆的，不是披露值。不标这一句，读者会把估算当财报口径。
+        lines += ["", "> 注：分部占比为模型估计，非公司披露口径。", ""]
     lines.append("")
     return lines
 
 
 def _section_market(result: dict, ma: dict, comp: dict) -> list[str]:
     lines = ["## 四、市场与竞争", ""]
-    ms = ma.get("market_share")
-    if ms is not None:
-        lines.append(f"- **全球市场份额**: {ms * 100:.1f}%")
     conc = ma.get("industry_concentration") or {}
     cr3, cr5, hhi = _num(conc.get("cr3")), _num(conc.get("cr5")), _num(conc.get("hhi"))
-    if any(v is not None for v in (cr3, cr5, hhi)):
+    has_conc = any(v is not None for v in (cr3, cr5, hhi))
+    ms = ma.get("market_share")
+    if ms is not None:
+        label = "市场份额" if has_conc else "份额（已知同业样本内）"
+        lines.append(f"- **{label}**: {ms * 100:.1f}%")
+    if has_conc:
         parts = []
         if cr3 is not None:
             parts.append(f"CR3 {cr3 * 100:.1f}%")
@@ -374,6 +418,8 @@ def _section_market(result: dict, ma: dict, comp: dict) -> list[str]:
         if hhi is not None:
             parts.append(f"HHI {hhi:.0f}")
         lines.append(f"- **行业集中度**: {' | '.join(parts)}")
+    elif conc.get("note"):
+        lines.append(f"- **行业集中度**: {conc['note']}")
     tam = ma.get("tam_estimate")
     if tam:
         lines.append(f"- **TAM 市场规模**: ${tam / 1e9:,.0f}B")
@@ -382,8 +428,9 @@ def _section_market(result: dict, ma: dict, comp: dict) -> list[str]:
     comp_data = global_m.get("competitor_data", [])
     company = ma.get("company", {})
     if comp_data or company.get("revenue"):
+        share_head = "份额" if has_conc else "份额（样本内）"
         lines += ["", "**主要竞争对手营收对比**:", "",
-                  "| 公司 | 营收 (USD) | 份额 |",
+                  f"| 公司 | 营收 (USD) | {share_head} |",
                   "| --- | ---: | ---: |"]
         for c in comp_data[:8]:
             name = c.get("name", "?")
@@ -607,12 +654,13 @@ def _section_risk(result: dict, geo: dict, sc: dict, fc: dict) -> list[str]:
         lines.append(f"**地缘政治事件**（风险等级: {ge.get('risk_level') or 'N/A'}）:")
         for ev in events:
             lines.append(f"- **{ev.get('event') or ev.get('name')}**（{ev.get('region') or '—'}，"
-                         f"概率 {ev.get('probability') or '—'}）")
+                         f"概率 {ev.get('probability') or '—'}，模型推断）")
             if ev.get("impact"):
                 lines.append(f"  - 影响: {ev['impact']}")
             if ev.get("transmission_path"):
                 lines.append(f"  - 传导: {ev['transmission_path']}")
-        lines.append("")
+        # 事件与概率都是模型推演，何况常带未来年份。不标出来会被当成既成事实读。
+        lines += ["", "> 注：以上地缘事件及其概率为模型情景推演，非事实陈述。", ""]
 
     if isinstance(sc, dict):
         sc_sum = sc.get("summary")
@@ -801,7 +849,7 @@ def result_to_markdown(result: dict, charts: dict | None = None) -> str:
         f"{result.get('pipeline_time') or '—'}s",
         "",
         *(_section_summary(result, fa, va, swot)),
-        *(_section_financial(fa)),
+        *(_section_financial(fa, result.get("pricing"))),
         *(_section_valuation(result, va, sotp)),
         *(_section_market(result, ma, comp)),
         *(_section_news(news)),

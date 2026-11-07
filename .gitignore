@@ -11,17 +11,12 @@ __pycache__/
 .venv/
 venv/
 
-# 数据与缓存
-data/*.db
-data/*.db-journal
-data/*.db-wal
-data/*.db-shm
-data/knowledge_db/
-
-# 运行时生成物
-data/*.log
-data/logs_*.txt
-data/phase*.json
+# 数据与缓存（运行时产物，体积大，不入库）
+# 只放行一个文件：采集白名单。policy.py 启动即读它，缺了采集链路直接失败。
+data/*
+!data/external/
+data/external/*
+!data/external/sources.yaml
 
 # 生成物
 reports/
@@ -29,6 +24,9 @@ reports/
 *.html
 *.png
 *.xlsx
+
+# 办公软件临时锁文件
+~$*
 
 # IDE
 .idea/

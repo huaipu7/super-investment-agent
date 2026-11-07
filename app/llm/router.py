@@ -9,7 +9,8 @@ from __future__ import annotations
 from app.config import get_settings
 
 # 常见任务名（供配置与文档引用）
-KNOWN_TASKS = ("intent", "plan", "report", "summary", "sentiment", "tool")
+KNOWN_TASKS = ("intent", "plan", "report", "summary", "sentiment", "tool",
+               "investigation")
 
 
 def resolve_model(task: str | None = None) -> str | None:

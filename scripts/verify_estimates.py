@@ -245,11 +245,85 @@ def _test_cache():
     _ok("缓存字段完整", got and got.get("trade_plan", {}).get("rating") == "看多")
 
 
+def _test_risk_free_chain():
+    """离线验证无风险利率的三级链路（不打网络，全部用假实现）。"""
+    print("== 无风险利率链路 ==")
+    from app.analysis import estimates as E
+
+    real_t, real_a = E._us_10y_treasury, E._us_10y_akshare
+    try:
+        E._us_10y_treasury = lambda: (0.0484, "US Treasury 每日收益率曲线 10 Yr（官方）", "2026-11-05")
+        E._us_10y_akshare = lambda: (0.0521, "akshare bond_zh_us_rate 美国国债收益率10年", "2026-11-05")
+        us = E.get_risk_free_rate(market="us")
+        _ok("美股 Rf 走财政部官方曲线",
+            us["value"] == 0.0484 and "Treasury" in us["source"] and us["confidence"] == "high",
+            str(us.get("value")))
+        _ok("美股 Rf 带观测日期", "2026-11-05" in (us.get("note") or ""), str(us.get("note")))
+
+        def _boom():
+            raise RuntimeError("treasury down")
+
+        E._us_10y_treasury = _boom
+        hk = E.get_risk_free_rate(market="hk")
+        _ok("财政部不可达时回落 akshare 美国10Y",
+            hk["value"] == 0.0521 and "akshare" in hk["source"], str(hk.get("source")))
+        _ok("港股用美元利率写明是近似",
+            "联系汇率" in (hk.get("note") or "") and hk["confidence"] == "medium",
+            str(hk.get("note")))
+
+        E._us_10y_akshare = _boom
+        dead = E.get_risk_free_rate(market="us")
+        _ok("两条通路都挂时回退常量并标 low",
+            dead["value"] == 0.025 and dead["confidence"] == "low", str(dead.get("value")))
+        _ok("回退时 source 写明失败原因",
+            "免费源不可用" in dead["source"] and "treasury down" in dead["source"],
+            dead["source"][:60])
+    finally:
+        E._us_10y_treasury, E._us_10y_akshare = real_t, real_a
+
+    # 范围校验在取数函数内部，假掉上层的 fetch 就测不到它——这里假的是数据源本身
+    import app.data.sources.treasury_source as TS
+
+    class _BadTS:
+        def fetch_yield_curve(self, months=3, as_of=None):
+            return pd.DataFrame({"10 Yr": [50.0]}, index=pd.to_datetime(["2026-11-05"]))
+
+    orig_ts = TS.TreasurySource
+    TS.TreasurySource = _BadTS
+    try:
+        try:
+            E._us_10y_treasury()
+            rejected = False
+        except ValueError as exc:
+            rejected = "超出合理范围" in str(exc)
+        _ok("越界利率(50%)被范围校验拒绝", rejected)
+    finally:
+        TS.TreasurySource = orig_ts
+
+    # A 股曾把 RangeIndex 行号当日期，写出「数据日期 7117」
+    import akshare as ak
+
+    orig_bond = ak.bond_zh_us_rate
+    ak.bond_zh_us_rate = lambda **kw: pd.DataFrame({
+        "日期": ["2026-11-04", "2026-11-05"],
+        "中国国债收益率10年": [1.6077, 1.6038],
+        "美国国债收益率10年": [4.90, 4.84],
+    })
+    try:
+        rate, _, obs = E._cn_10y_akshare()
+        _ok("A股 Rf 观测日期取日期列而非行号",
+            obs == "2026-11-05" and abs(rate - 0.016038) < 1e-9, f"{obs} / {rate}")
+    finally:
+        ak.bond_zh_us_rate = orig_bond
+
+
 def main():
     print("=" * 60)
     print("verify_estimates.py — Phase 1 估算真实化 + 新指标 + 策略增强 + 缓存")
     print("=" * 60)
     _test_estimates_core()
+    print()
+    _test_risk_free_chain()
     print()
     _test_financial_new()
     print()

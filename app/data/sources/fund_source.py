@@ -16,6 +16,30 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# 上游用这些字面量表示「这一栏没有数」，它们不是数值
+_MISSING_TOKENS = frozenset({"", "-", "--", "—", "nan", "none", "null"})
+
+
+def _num(v) -> float | None:
+    """净值字段转数值。
+
+    上游对空栏位返回的是空串而不只是 '-'，只判 '-' 会让 float('') 抛
+    ValueError，把整张快照打掉。缺值一律返回 None，不填 0。
+    """
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return None if v != v else float(v)  # v != v 只在 NaN 时为真
+    s = str(v).strip()
+    if s.lower() in _MISSING_TOKENS:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        logger.warning(f"净值字段无法解析为数值: {v!r}")
+        return None
+
+
 # ========== 全局缓存 ==========
 
 _FUND_LIST_CACHE: list[dict] | None = None  # 全量基金列表
@@ -103,13 +127,30 @@ def fund_realtime_nav(fund_code: str) -> dict | None:
     row = row.iloc[0]
     cols = list(df.columns)
 
-    unit_nav_col = None
-    cum_nav_col = None
-    for c in cols:
-        if c.endswith("单位净值"):
-            unit_nav_col = c
-        if c.endswith("累计净值"):
-            cum_nav_col = c
+    def _nav_col(keyword: str) -> str | None:
+        """挑最新的非空净值列。
+
+        东财按日期倒序列出两列净值（今日在前、昨日在后）。原先「后写覆盖」
+        取到的是最后一列，也就是昨日那列——今日净值已发布时，会把隔夜值
+        当成今日值报出去。
+        """
+        cands = [c for c in cols if c.endswith(keyword)]
+        dated: list[tuple[str, str]] = []
+        for c in cands:
+            m = re.match(r"(\d{4}-\d{2}-\d{2})", c)
+            if m:
+                dated.append((m.group(1), c))
+        dated.sort()
+        for _d, c in reversed(dated):
+            if _num(row[c]) is not None:
+                return c
+        for c in cands:
+            if _num(row[c]) is not None:
+                return c
+        return dated[-1][1] if dated else None
+
+    unit_nav_col = _nav_col("单位净值")
+    cum_nav_col = _nav_col("累计净值")
 
     nav_date = None
     if unit_nav_col:
@@ -120,10 +161,10 @@ def fund_realtime_nav(fund_code: str) -> dict | None:
     result = {
         "基金代码": row.iloc[0],
         "基金简称": row.iloc[1],
-        "单位净值": float(row[unit_nav_col]) if unit_nav_col and row[unit_nav_col] != "-" else None,
-        "累计净值": float(row[cum_nav_col]) if cum_nav_col and row[cum_nav_col] != "-" else None,
-        "日增长率": float(row["日增长率"]) if "日增长率" in cols and row["日增长率"] != "-" else None,
-        "日增长值": float(row["日增长值"]) if "日增长值" in cols and row["日增长值"] != "-" else None,
+        "单位净值": _num(row[unit_nav_col]) if unit_nav_col else None,
+        "累计净值": _num(row[cum_nav_col]) if cum_nav_col else None,
+        "日增长率": _num(row["日增长率"]) if "日增长率" in cols else None,
+        "日增长值": _num(row["日增长值"]) if "日增长值" in cols else None,
         "申购状态": str(row["申购状态"]) if "申购状态" in cols else None,
         "赎回状态": str(row["赎回状态"]) if "赎回状态" in cols else None,
         "手续费": str(row["手续费"]) if "手续费" in cols else None,

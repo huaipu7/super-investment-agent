@@ -11,6 +11,8 @@ from __future__ import annotations
 import time
 from typing import Optional
 
+import pandas as pd
+
 from app.analysis.financial import FinancialAnalyzer
 from app.analysis.market import MarketAnalyzer
 from app.analysis.competitive import CompetitiveAnalyzer
@@ -21,6 +23,8 @@ from app.analysis.supply_chain import SupplyChainAnalyzer
 from app.analysis.valuation import DCFModel
 from app.analysis.segment import SegmentAnalyzer
 from app.analysis.news import NewsAnalyzer
+from app.analysis.price_series import build_price_history
+from app.analysis.pricing import build_pricing
 from app.analysis.meeting import MeetingAnalyzer
 from app.analysis.industry import (
     IndustryClass,
@@ -30,8 +34,43 @@ from app.analysis.industry import (
 )
 from app.config import get_settings
 from app.data.cleaning.pipeline import CleaningPipeline
-from app.data.router import is_ashare, get_market_data
+from app.data.router import is_ashare, is_hk, get_market_data
+from app.data.sources.akshare_us_source import is_us_ticker
+from app.trust.completeness import check_completeness
+from app.trust.sanitize import sanitize_result
 from app.utils.logger import logger
+
+
+def _refresh_relative_valuation_summary(valuation_result: dict) -> None:
+    """用最新的 relative_valuation 重建摘要里的「相对估值」一项。
+
+    竞品真实 PE 覆盖 industry_avg/premium 发生在估值分析**之后**，
+    不重建摘要就会留下覆盖前的溢价，与正文表格口径自相矛盾。
+    """
+    summary = valuation_result.get("summary")
+    rel = valuation_result.get("relative_valuation") or {}
+    if not summary or not rel:
+        return
+    premiums = [f"{mk.upper()} {e['premium']:+.1%}"
+                for mk, e in rel.items()
+                if isinstance(e, dict) and e.get("premium") is not None]
+    if not premiums:
+        return
+    fresh = "相对估值: " + "，".join(premiums)
+    parts, replaced = [], False
+    for part in summary.split("；"):
+        if part.startswith("相对估值:"):
+            parts.append(fresh)
+            replaced = True
+        else:
+            parts.append(part)
+    if not replaced:
+        parts.append(fresh)
+    valuation_result["summary"] = "；".join(parts)
+
+
+# 插补明细写入产物的条数上限（防止极端缺失时产物膨胀）
+_CLEANING_DETAIL_LIMIT = 50
 
 
 class AnalysisOrchestrator:
@@ -55,6 +94,40 @@ class AnalysisOrchestrator:
         self.segment_analyzer = SegmentAnalyzer()
         self.news_analyzer = NewsAnalyzer()
         self.meeting_analyzer = MeetingAnalyzer()
+
+    def _cleaning_record(self) -> dict:
+        """清洗阶段的插补/去重痕迹。
+
+        以前 CleaningPipeline.report() 从没被调用过，插补记录收集完就丢了——
+        财务比率里混进前向填充值，从产物上完全看不出来。
+        """
+        handler = getattr(self.cleaning_pipeline, "missing_handler", None)
+        entries = list(getattr(getattr(handler, "record", None), "entries", []) or [])
+
+        imputed = [
+            {
+                "statement": e.get("statement", ""),
+                # 索引来自 pandas Timestamp，去掉时间部分好让台账的 as_of 干净
+                "period": str(e.get("period", "")).split(" ")[0],
+                "metric": e.get("metric", ""),
+                "method": e.get("method", ""),
+                "value": float(e["value"]),
+                "imputed": True,
+                "imputed_reason": f"{e.get('method') or '插补'} 插补",
+            }
+            for e in entries[:_CLEANING_DETAIL_LIMIT]
+            if isinstance(e.get("value"), (int, float))
+        ]
+
+        out = {
+            "imputed_count": len(entries),
+            "imputed_metrics": imputed,
+            "note": "imputed_metrics 为被填补的单元格原值（用于对照组），非原始财报数",
+        }
+        if len(entries) > _CLEANING_DETAIL_LIMIT:
+            out["truncated"] = True
+            out["note"] += f"；明细仅列前 {_CLEANING_DETAIL_LIMIT} 条"
+        return out
 
     def _fetch_competitor_revenues(self, competitors: list[dict]) -> list[dict]:
         """获取竞品企业的营收数据（用于市场集中度计算）"""
@@ -82,6 +155,7 @@ class AnalysisOrchestrator:
             return amount * rate
 
         yf_src = self.market_data.yfinance
+        md = self.market_data
         competitor_data = []
         for comp in competitors[:15]:
             name = comp.get("name", "")
@@ -107,10 +181,13 @@ class AnalysisOrchestrator:
                 continue
 
             try:
-                fin = yf_src.get_financials(ticker)
+                # 走 router 而非裸 yfinance：美股竞品才能经东财拿到财报（Yahoo 已 403）
+                fin = md.get_financials(ticker)
                 rev = fin.get("revenue")
-                cinfo = yf_src.fetch_company_info(ticker)
-                currency = cinfo.get("currency", "USD")
+                cinfo = md.fetch_company_info(ticker)
+                # 营收的币种必须取**报表记账币种**（fin.currency，ADR 常见 CNY/KRW），
+                # 不能取 cinfo.currency（那是对外报价的挂牌币种，美股恒为 USD）
+                currency = fin.get("currency") or cinfo.get("currency", "USD")
                 # 真实 trailing PE（yfinance，免费源）与市值，供行业 PE 中位数估算
                 pe = fin.get("pe_ratio") or fin.get("forward_pe")
                 market_cap = cinfo.get("market_cap")
@@ -186,7 +263,12 @@ class AnalysisOrchestrator:
 
         md = self.market_data
         ashare = is_ashare(ticker)
-        cleaning_source = "akshare" if ashare else "yfinance"
+        if ashare:
+            cleaning_source = "akshare"
+        elif is_us_ticker(ticker):
+            cleaning_source = "akshare_us"
+        else:
+            cleaning_source = "yfinance"
 
         # ── 1. 数据获取 ──
         logger.info("[1/7] 获取财务数据...")
@@ -215,12 +297,19 @@ class AnalysisOrchestrator:
 
         # 估算参数 Rf/Beta/ERP —— 缺失显式标注来源与置信度，不静默编造
         param_estimates: dict = {}
+        # 提示词里的宏观利率必须与产物里那条事实同源；拿不到真实利率时传空串，
+        # 由 build_system_prompt 注入「禁止给具体数值」，而不是让模型自己编一个。
+        market = "cn" if ashare else ("hk" if is_hk(ticker) else "us")
+        macro_line = ""
         try:
             from app.analysis import estimates as est_mod
-            rf_est = est_mod.get_risk_free_rate(ashare=ashare)
+            from app.analysis.master_prompt import macro_context
+
+            rf_est = est_mod.get_risk_free_rate(market=market)
             beta_est = est_mod.compute_beta(price_data, benchmark_df)
             erp_est = est_mod.estimate_erp(benchmark_df, rf_est.get("value"), fallback_erp=0.05)
             param_estimates = {"risk_free_rate": rf_est, "beta": beta_est, "erp": erp_est}
+            macro_line = macro_context(rf_est, market)
         except Exception as e:
             logger.warning("估算参数计算失败: %s", e)
 
@@ -281,6 +370,8 @@ class AnalysisOrchestrator:
             price_data=price_data,
             industry_cls=industry_cls,
         )
+        # 插补痕迹：清洗阶段填过的值必须能追溯，否则财务比率里混着插补值却无人知晓
+        financial_result["cleaning"] = self._cleaning_record()
         # ── 2.1 财报季度化（Phase 4）：A 股近 4 季度营收/净利趋势 + 同比 ──
         # 美股季度财报未接入（本报告为年报口径），如实标注，不编造。
         if ashare:
@@ -319,7 +410,7 @@ class AnalysisOrchestrator:
         logger.info("[2.75/7] 执行 SOTP 分部估值...")
         try:
             company_name_step = company_info.get("name", ticker)
-            segments = self.segment_analyzer.identify_segments(company_info)
+            segments = self.segment_analyzer.identify_segments(company_info, macro_line=macro_line)
             raw_metrics = financial_result.get("raw_metrics", {})
             ni_series = raw_metrics.get("NET_INCOME", [])
             total_ni = ni_series[-1]["value"] if ni_series and ni_series[-1]["value"] is not None else None
@@ -361,6 +452,7 @@ class AnalysisOrchestrator:
                 industry=industry,
                 business_summary=business_summary,
                 market=market_label,
+                macro_line=macro_line,
             )
 
             competitor_data = self._fetch_competitor_revenues(competitors)
@@ -410,7 +502,9 @@ class AnalysisOrchestrator:
                 articles=news_data.get("articles", []),
                 briefings=news_data.get("briefings", []),
                 industry=industry,
-                source="东财新闻 + 巨潮公告" if ashare else "yfinance 新闻",
+                source=("东财新闻 + 巨潮公告" if ashare
+                        else ("东财美股（暂无新闻接口）" if is_us_ticker(ticker)
+                              else "yfinance 新闻")),
             )
             logger.info("  新闻舆情: %d 篇新闻 / %d 条公告, 情绪=%s",
                         news_analysis.get("article_count", 0),
@@ -480,6 +574,7 @@ class AnalysisOrchestrator:
             company_name=company_name,
             industry=industry,
             business_summary=business_summary,
+            macro_line=macro_line,
         )
         geopolitical_result = {
             "tariff_sensitivity": tariff_sensitivity,
@@ -529,6 +624,7 @@ class AnalysisOrchestrator:
             financial_summary=financial_summary,
             competitors=competitors_for_comp,
             industry_cls=industry_cls,
+            macro_line=macro_line,
         )
         _emit("5/7", "竞品分析", "竞品对比完成", 80)
 
@@ -547,6 +643,7 @@ class AnalysisOrchestrator:
                     if c and c > 0:
                         pe["premium"] = (c - peer_pe_est["value"]) / peer_pe_est["value"]
                 valuation_result.setdefault("estimates", {})["industry_pe"] = peer_pe_est
+                _refresh_relative_valuation_summary(valuation_result)
                 logger.info("行业 PE 用竞品真实中位数覆盖: %s", peer_pe_est["source"])
         except Exception as e:
             logger.warning("竞品 PE 覆盖失败: %s", e)
@@ -574,6 +671,7 @@ class AnalysisOrchestrator:
             rag_context=rag_context,
             financial_analysis=financial_result,
             industry_cls=industry_cls,
+            macro_line=macro_line,
         )
         _emit("6/7", "SWOT 分析", f"评级 {swot_result.get('rating', 'N/A')}", 90)
 
@@ -605,24 +703,9 @@ class AnalysisOrchestrator:
         _emit("done", "分析完成", f"总耗时 {elapsed:.1f}s", 100)
 
         # 行情序列（供报告 K线+均线叠加图，取最近 300 交易日，列式真实数据）
-        price_history: dict = {"available": False, "reason": "无历史行情数据"}
-        if price_data is not None and not price_data.empty:
-            try:
-                tail = price_data.tail(300)
-                def _d(v):
-                    return v.strftime("%Y-%m-%d") if hasattr(v, "strftime") else str(v)
-                price_history = {
-                    "available": True,
-                    "dates": [_d(d) for d in tail.index],
-                    "open": [float(x) for x in tail["Open"]],
-                    "high": [float(x) for x in tail["High"]],
-                    "low": [float(x) for x in tail["Low"]],
-                    "close": [float(x) for x in tail["Close"]],
-                    "volume": [float(x) for x in tail["Volume"]],
-                }
-            except Exception as e:
-                logger.warning("行情序列序列化失败: %s", e)
-                price_history = {"available": False, "reason": f"行情序列序列化失败: {e}"}
+        price_history = build_price_history(price_data)
+        # 行情时点：现价对应哪个交易日（字符串/布尔，不产生台账事实）
+        pricing = build_pricing(price_data)
 
         result = {
             "ticker": ticker,
@@ -644,6 +727,7 @@ class AnalysisOrchestrator:
             "knowledge": knowledge,
             "trade_plan": trade_plan,
             "price_history": price_history,
+            "pricing": pricing,
             "sector_adapter": SectorAdapter.get_config(industry_cls),
             "pipeline_time": round(elapsed, 2),
         }
@@ -657,5 +741,17 @@ class AnalysisOrchestrator:
             logger.info("  %s 竞品: %d 家", label, len(markets_data[mk_key].get("competitors", [])))
         logger.info("  SWOT 评级: %s", swot_result.get("rating", "N/A"))
         logger.info("=" * 50)
+
+        # 落地前净化：非有限值转 None 并留痕，保证产物是合法 JSON（见 app/trust/sanitize.py）
+        result = sanitize_result(result)
+        if result.get("data_quality", {}).get("non_finite"):
+            logger.warning("产物含 %d 处非有限数值，已置为 None: %s",
+                           len(result["data_quality"]["non_finite"]),
+                           [p["path"] for p in result["data_quality"]["non_finite"][:5]])
+
+        # 章节完整性门：核心章节缺数据时明确标出来（见 app/trust/completeness.py）
+        result["completeness"] = check_completeness(result)
+        if not result["completeness"]["complete"]:
+            logger.warning("核心章节不完整: %s", result["completeness"]["gaps"])
 
         return result

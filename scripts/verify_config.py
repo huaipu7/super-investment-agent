@@ -80,6 +80,55 @@ def main():
                   s.audit_db == tmp / "data/audit.db", str(s.audit_db))
             check("COMPLIANCE_DB_PATH 字段", s.COMPLIANCE_DB_PATH == "data/compliance.db",
                   s.COMPLIANCE_DB_PATH)
+
+        # ── 场景 5：自主深度调查预算（硬天花板，默认即上限）──
+        os.environ["ENV"] = "dev"
+        with mock.patch.object(cfg, "BASE_DIR", tmp2):
+            s = _fresh_settings(tmp2)
+            check("调查：ENABLED 默认开", s.INVESTIGATION_ENABLED is True)
+            check("调查：标准档轮次上限", s.INVESTIGATION_STANDARD_MAX_ROUNDS == 6,
+                  str(s.INVESTIGATION_STANDARD_MAX_ROUNDS))
+            check("调查：标准档工具调用上限", s.INVESTIGATION_STANDARD_MAX_TOOL_CALLS == 14,
+                  str(s.INVESTIGATION_STANDARD_MAX_TOOL_CALLS))
+            check("调查：标准档 LLM 调用上限", s.INVESTIGATION_STANDARD_MAX_LLM_CALLS == 10,
+                  str(s.INVESTIGATION_STANDARD_MAX_LLM_CALLS))
+            check("调查：标准档 deadline", s.INVESTIGATION_STANDARD_DEADLINE_SECONDS == 300,
+                  str(s.INVESTIGATION_STANDARD_DEADLINE_SECONDS))
+            check("调查：深度档轮次上限", s.INVESTIGATION_DEEP_MAX_ROUNDS == 12,
+                  str(s.INVESTIGATION_DEEP_MAX_ROUNDS))
+            check("调查：深度档 LLM 调用上限", s.INVESTIGATION_DEEP_MAX_LLM_CALLS == 20,
+                  str(s.INVESTIGATION_DEEP_MAX_LLM_CALLS))
+            check("调查：深度档 deadline 小于 SSE 兜底 900",
+                  s.INVESTIGATION_DEEP_DEADLINE_SECONDS < 900,
+                  str(s.INVESTIGATION_DEEP_DEADLINE_SECONDS))
+            check("调查：深档单假设证据上限", s.INVESTIGATION_DEEP_MAX_EVIDENCE_PER_HYPOTHESIS == 6,
+                  str(s.INVESTIGATION_DEEP_MAX_EVIDENCE_PER_HYPOTHESIS))
+            check("调查：深档 peer 上限", s.INVESTIGATION_DEEP_MAX_PEERS == 5,
+                  str(s.INVESTIGATION_DEEP_MAX_PEERS))
+            check("调查：无进展窗口", s.INVESTIGATION_NO_PROGRESS_WINDOW == 3,
+                  str(s.INVESTIGATION_NO_PROGRESS_WINDOW))
+            check("调查：最小轮次秒数", s.INVESTIGATION_MIN_ROUND_SECONDS == 60,
+                  str(s.INVESTIGATION_MIN_ROUND_SECONDS))
+            check("调查：深档上限严格大于标准档",
+                  s.INVESTIGATION_DEEP_MAX_ROUNDS > s.INVESTIGATION_STANDARD_MAX_ROUNDS
+                  and s.INVESTIGATION_DEEP_MAX_TOOL_CALLS > s.INVESTIGATION_STANDARD_MAX_TOOL_CALLS
+                  and s.INVESTIGATION_DEEP_MAX_LLM_CALLS > s.INVESTIGATION_STANDARD_MAX_LLM_CALLS,
+                  "轮次/工具/LLM 三档均递增")
+
+        # ── 场景 5b：环境变量可覆盖 ──
+        os.environ["INVESTIGATION_STANDARD_MAX_ROUNDS"] = "3"
+        try:
+            with mock.patch.object(cfg, "BASE_DIR", tmp2):
+                s = _fresh_settings(tmp2)
+            check("调查：配置可被 env 覆盖", s.INVESTIGATION_STANDARD_MAX_ROUNDS == 3,
+                  str(s.INVESTIGATION_STANDARD_MAX_ROUNDS))
+        finally:
+            os.environ.pop("INVESTIGATION_STANDARD_MAX_ROUNDS", None)
+
+        # ── 场景 6：investigation 是已注册的任务名 ──
+        from app.llm.router import KNOWN_TASKS
+        check("KNOWN_TASKS 含 investigation", "investigation" in KNOWN_TASKS,
+              str(KNOWN_TASKS))
     finally:
         if prev_env is None:
             os.environ.pop("ENV", None)

@@ -4,10 +4,11 @@ LLM 调用统一走 app.agent.llm。
 """
 from __future__ import annotations
 
-import json
 import re
 
 from app.agent.llm import chat, chat_tool_calls
+from app.llm.schemas import FundIntentResult
+from app.llm.structured import parse_llm_json
 
 # ===== 基金意图类型 =====
 
@@ -91,12 +92,8 @@ def _parse_with_function_calling(user_input: str) -> dict | None:
 
         for tc in tool_calls:
             if tc["name"] == "parse_fund_intent":
-                args = json.loads(tc["arguments"])
-                return {
-                    "intent": args.get("intent"),
-                    "fund_codes": args.get("fund_codes", []),
-                    "fund_names": args.get("fund_names", []),
-                }
+                return parse_llm_json(tc["arguments"], model=FundIntentResult, default=None,
+                                      context="基金意图(FC)")
         return None
     except Exception:
         return None
@@ -109,8 +106,8 @@ def _parse_with_llm(user_input: str) -> dict | None:
             {"role": "system", "content": FUND_INTENT_SYSTEM_PROMPT},
             {"role": "user", "content": user_input},
         ], task="intent")
-        result = result.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        return json.loads(result)
+        return parse_llm_json(result, model=FundIntentResult, default=None,
+                              context="基金意图(JSON)")
     except Exception:
         return None
 

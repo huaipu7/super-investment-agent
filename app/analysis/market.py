@@ -76,7 +76,8 @@ class MarketAnalyzer:
                 "market_cap": company_info.get("market_cap"),
             },
             "market_share": None,
-            "industry_concentration": {"cr3": None, "cr5": None, "hhi": None},
+            "industry_concentration": {"cr3": None, "cr5": None, "hhi": None,
+                                       "note": "无竞品数据，未计算行业集中度"},
             "tam_estimate": None,
             "competitors": [],
         }
@@ -96,6 +97,7 @@ class MarketAnalyzer:
         target_revenue: Optional[float],
         competitors: list[dict],
         target_name: str = "",
+        industry_total: Optional[float] = None,
     ) -> dict:
         """分析目标公司在竞品中的市场位置
 
@@ -103,15 +105,22 @@ class MarketAnalyzer:
             target_revenue: 目标公司营收
             competitors: 竞品列表 [{"name": str, "revenue": float, "period": str}, ...]
             target_name: 目标公司名
+            industry_total: 行业总规模。缺它就算不出行业集中度
+
+        CR3/CR5/HHI 必须有行业总规模才有意义。如果只把「目标 + 已知竞品」的营收
+        相加当分母，样本恰好 5 家时 CR5 恒等于 100%（600519 连 CR3 都是 1.0），
+        报告却印成「行业集中度」——数值真实但口径是假的。缺 industry_total 时
+        三项一律返回 None 并在 concentration_note 里说明，不拿样本内占比冒充行业口径。
 
         Returns:
             {
-                "total_market": float,         # 已知市场总规模
-                "market_share": float | None,  # 目标公司份额
-                "rank": int,                   # 排名
+                "total_market": float,         # 已知同业样本营收合计（不是行业规模）
+                "market_share": float | None,  # 目标公司份额（缺行业规模时是样本内占比）
+                "rank": int,                   # 排名（样本内，可靠）
                 "cr3": float | None,           # 前三集中度
                 "cr5": float | None,           # 前五集中度
                 "hhi": float | None,           # Herfindahl-Hirschman Index
+                "concentration_note": str | None,
                 "competitors": [...],
             }
         """
@@ -128,22 +137,25 @@ class MarketAnalyzer:
 
         if not valid:
             return {"total_market": 0, "market_share": None, "rank": 0,
-                    "cr3": None, "cr5": None, "hhi": None, "competitors": []}
+                    "cr3": None, "cr5": None, "hhi": None,
+                    "concentration_note": "无可比同业营收", "competitors": []}
 
         total = sum(p["revenue"] for p in valid)
-        n = len(valid)
 
-        # 计算份额
+        # 份额分母：有行业规模才用行业口径；否则只能算样本内占比（仅供排序与对比）
+        scale = float(industry_total) if industry_total and industry_total > 0 else None
+        denom = scale or total
         for p in valid:
-            p["share"] = p["revenue"] / total if total > 0 else 0
+            p["share"] = p["revenue"] / denom if denom > 0 else 0
 
-        # CR3 / CR5
-        cr3 = sum(p["share"] for p in valid[:3]) if n >= 3 else sum(p["share"] for p in valid)
-        cr5 = sum(p["share"] for p in valid[:5]) if n >= 5 else sum(p["share"] for p in valid)
-
-        # HHI = sum of squared market shares (as %)
-        shares_pct = [p["share"] * 100 for p in valid]
-        hhi = sum(s * s for s in shares_pct)
+        if scale:
+            cr3 = round(sum(p["share"] for p in valid[:3]), 4)
+            cr5 = round(sum(p["share"] for p in valid[:5]), 4)
+            hhi = round(sum((p["share"] * 100) ** 2 for p in valid), 1)
+            note = None
+        else:
+            cr3 = cr5 = hhi = None
+            note = "缺行业总规模，未计算行业集中度（份额为已知同业样本内占比）"
 
         # 目标公司排名
         rank = 0
@@ -164,6 +176,7 @@ class MarketAnalyzer:
             "cr3": cr3,
             "cr5": cr5,
             "hhi": hhi,
+            "concentration_note": note,
             "competitors": valid,
         }
 
@@ -256,6 +269,7 @@ class MarketAnalyzer:
             "cr3": analysis["cr3"],
             "cr5": analysis["cr5"],
             "hhi": analysis["hhi"],
+            "note": analysis.get("concentration_note"),
         }
         result["tam_estimate"] = self.estimate_tam(
             result["company"].get("industry", ""),

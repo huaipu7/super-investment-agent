@@ -33,6 +33,11 @@ def check(name: str, ok: bool, detail: str = ""):
     print(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
 
 
+def _render_head(text: str, n: int = 20) -> str:
+    """片段落到归档 md 后开头长什么样（对齐 markdown.py 的 strip + 换行转空格）。"""
+    return str(text or "").strip().replace("\n", " ")[:n]
+
+
 def code_checks() -> None:
     ui = (ROOT / "ui" / "pages" / "research.py").read_text(encoding="utf-8")
     ra = (ROOT / "api" / "routes_analysis.py").read_text(encoding="utf-8")
@@ -92,7 +97,11 @@ def archive_with_real_rag() -> None:
 
         check("归档 md 文件生成", md_path.is_file(), str(md_path.name))
         check("归档 md 含 ## 九、知识库参考", "## 九、知识库参考" in md)
-        check("归档 md 含真实片段内容", str(docs[0].page_content)[:20] in md)
+        # 渲染端会把片段里的换行压成空格（markdown.py 的 _section_knowledge），
+        # 所以比对前要做同样的变换；且用 any 覆盖全部片段，不赌某一条排第一。
+        check("归档 md 含真实片段内容",
+              any(_render_head(d.page_content) in md for d in docs),
+              f"n={len(docs)}")
         check("归档 md 片段标注相关度", "相关度" in md)
         kinds = {d.metadata.get("kind") for d in docs}
         print(f"  [真实片段] n={len(docs)} kinds={sorted(kinds)}")

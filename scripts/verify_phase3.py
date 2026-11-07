@@ -46,11 +46,13 @@ def _synthetic_result() -> dict:
         "company_info": {"shares_outstanding": 100.0, "name": "测试"},
         "financial_analysis": {
             "fcf_history": [80.0, 90.0, 105.0, 118.0, 130.0],
-            "current_price": 8.0,
+            # 现价与自身 DCF 内在价值同量级：原值 8.0 会得到 ~69.5 的内在价值
+            # （8.7 倍），触发 valuation.FAIR_VALUE_PRICE_BAND 降级，属夹具不自洽
+            "current_price": 40.0,
             "raw_metrics": {"NET_DEBT": [{"period": "2024", "value": 50.0}]},
         },
         "valuation_analysis": {
-            "dcf": {"wacc_used": 0.09, "fair_value": 8.0,
+            "dcf": {"wacc_used": 0.09, "fair_value": 40.0,
                     "terminal_growth": 0.03, "projection_years": 5},
             "estimates": {
                 "risk_free_rate": {"value": 0.045, "source": "test"},
@@ -165,7 +167,7 @@ def _test_recompute_dcf():
     _ok("available", out.get("available") is True)
     _ok("fair_value 与手工一致", abs(out["fair_value"] - expect_fv) < 0.05,
         f"got={out['fair_value']} expect={expect_fv:.2f}")
-    expect_upside = (expect_fv - 8.0) / 8.0
+    expect_upside = (expect_fv - 40.0) / 40.0
     _ok("upside 计算", abs(out["upside"] - expect_upside) < 1e-5,
         f"got={out['upside']} expect={expect_upside:.6f}")
     _ok("敏感性矩阵 5×5", len(out["sensitivity"]["matrix"]) == 5)

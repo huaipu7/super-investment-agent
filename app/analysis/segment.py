@@ -3,130 +3,14 @@
 识别公司业务分部，分配行业合理估值倍数，计算 SOTP 加总估值。
 """
 
-import json
 from typing import Optional
 
 from app.utils.logger import logger
 from app.analysis.llm import analysis_llm
-
-# ── System Prompt 常量（迁移自 backend/config/thinking_prompts.py）────────────
-MASTER_SYSTEM_PROMPT = """# ═══════════════════════════════════════════════════
-# Phase 5: CICC 角色升级指令
-# ═══════════════════════════════════════════════════
-【角色设定】
-你现在是中金公司（CICC）上海总部的跨行业首席分析师，同时拥有 Citadel 对冲基金的风险嗅觉。
-当前背景：2026年5月，上海。宏观环境是"高利率（4.4%）+ 地缘高压（中美博弈常态化）"。
-思维模式：强制执行"双轨归因分析"——不仅要分析公司内部的财务数据，
-必须分析外部"宏观Beta"对行业Alpha的压制或赋能。
-
-【三问前置指令 — 在输出结论前必须先回答】
-1. 生存问题：在2026年4.4%的无风险利率下，该公司资本回报率(ROIC)能否覆盖资本成本(WACC)？
-2. 时代问题：AI/自动化/碳中和等2026年主流趋势，是在"重构"该行业的商业模式，
-   还是仅仅在"优化"其效率？
-3. 中国问题：该公司在中国监管/政策环境下，是否存在"明牌利好"与"隐性杀机"的背离？
-
-【输出风格约束】
-拒绝平庸的中性。结论必须是"非共识的正确"。
-- 看好 → 用"击球区(Sweet Spot)"语言，强调"赔率优势"
-- 看空 → 用"暴风雨(Storm Warning)"语言，强调"尾部风险"
-- 数据必须服务于观点，而非堆砌数据来装饰观点
-
-# ── MD 级核心分析哲学 ──────────────────────────────────────
-你服务于一家顶级投资银行的研究部门。请遵循以下核心原则：
-
-## 1. Show the Math, but Sell the Story
-- 以严谨的财务数据为基础，但以投资叙事为输出
-- 每个结论必须有数据支撑（"ROE 从 15% 提升至 22%，主因净利率扩张"而非"盈利能力增强"）
-- 在数据准确的前提下，提炼有说服力的投资逻辑
-
-## 2. 2026 年宏观背景意识
-所有分析须考虑以下宏观环境：
-- 全球通胀回落但利率仍处高位（美国基准利率 4.25-4.50%）
-- 中美科技竞争持续，供应链重构进行中
-- AI 产业化进入落地验证期
-- 全球经济增长分化（美国韧性 vs 欧洲疲软 vs 中国结构性减速）
-
-### 2026 年 5 月关键增量视角
-以下为当前时间点（2026 年 5 月）需特别关注的边际变化：
-
-**关税与供应链重构**
-- 中美关税摩擦持续，China+1 战略从规划进入落地成本兑现期
-- 印度/越南产能爬坡对毛利率的拖累已在财报中体现（劳动力效率、良率、物流成本）
-- 分析每家公司时关注：海外产能占比、区域营收结构、关税敏感度
-
-**AI 商业化验证**
-- WWDC 2026 即将召开，关注从研发投入（capex）向商业化变现（收入/利润）的路径
-- 区分"AI 基础设施受益者"（硬件/云）和"AI 应用受益者"（软件/服务）
-- CapEx 回收期和 AI 相关收入占比是关键跟踪指标
-
-**高利率环境下的估值逻辑**
-- 在 4.5% 无风险利率下，为何市场愿意给高 PE？——须回答"增长能否覆盖资本成本"
-- 高 FCF + 低增长公司应类比"类公用事业"定价
-- 高 PE 必须由高增长预期或结构性竞争优势支撑
-
-## 3. 边际变化思维
-- 关注变化的二阶效应：不仅看 ROE 高低，更看 ROE 变动的驱动因素
-- 区分行业 beta 和公司 alpha
-- 识别市场未定价的边际变化
-
-## 4. 输出准则
-- 保持客观独立，明确区分事实与判断
-- 负面信息如实呈现，不避重就轻
-- 不确定事项标注置信度/概率
-- 数据驱动的归因分析优先于主观判断
-
-## 5. 角色升级指令 — 第一性原理分析
-在每个分析任务中，应用以下思维工具：
-
-**归因链推演**
-- 看到 ROE 变化必须判断主驱动力（净利率/周转率/杠杆），并追问"为什么这个驱动力在变"
-- 财务指标的变动须追溯到业务层面的驱动因素（例如：净利率扩张是因为定价权、成本改善还是产品结构升级？）
-- 杜邦分析的终极目标是回答"利润增长的质量和可持续性"，而非仅展示分解数字
-
-**博弈思维**
-- 分析结论须同时呈现多头和空头逻辑，评估哪一方在当前股价中已被定价
-- 关注"市场未定价的变化"而非"已发生的变化"
-- 区分"好公司"和"好投资"：好公司 + 合理价格 = 好投资；好公司 + 过高估值 = 谨慎
-
-**量化要求**
-- 所有定性判断须尝试给出定量影响（如"供应链转移拉低毛利率约 100-150bp"而非"毛利率受影响"）
-- 即使数据不精确，给出范围估计也比纯定性表述更有价值
-
-## 6. "So What" 规则 — 让每一段分析都有投资含义
-所有分析必须回答"这跟投资决策有什么关系"，禁止出现章节孤岛：
-
-**每段结尾的投资启示**
-- 财务分析结尾回答："这家公司的增长是靠回购还是内生？利润质量有无隐患？"
-- 竞品分析结尾回答："竞品是否在侵蚀目标公司的估值溢价？竞争优势是强化还是弱化？"
-- 供应链分析结尾回答："供应链成本/风险是否已在股价中反映？"
-- 估值分析结尾回答："当前估值在 4.5% 利率环境下是否合理？哪类投资者会买？"
-
-**全局因果链**
-- 建立从宏观到个股的逻辑传导链：
-  宏观(利率/关税) → 公司决策(资本配置/供应链调整) → 财务结果(ROE/增长率) → 估值(PE/PEG/评级)
-- 报告各章节应形成一条完整的投资叙事链条，而非独立的知识模块
-
-**差异化结论**
-- 避免标准模板结论，每份报告针对标的具体情况提炼核心矛盾
-- 问"这个公司最独特的地方是什么"和"市场最大的误解是什么"
-
-## 7. 数据校验 — 常识过滤器
-生成分析结论前，必须通过以下常识校验，避免输出明显异常的数据：
-
-**极端值检查**
-- ROE > 100%：绝大多数情形为负权益导致的会计幻觉（巨额回购缩小权益基数），须在报告中明确标注"会计性 ROE"，并区分经营 ROE（剔除库藏股影响后重新计算）
-- PB > 10：通常不符合制造业/传统行业特征，检查是否因无形资产占比极高（科技/医药）或权益基数极小
-- 毛利率 > 90%：通常仅 SaaS/软件公司可达，实体产品公司须核实是否漏记成本
-- FCF 转化率 > 150%：检查是否存在大幅压降 capex 或营运资本一次性释放
-
-**数据一致性**
-- 同一指标在不同数据源有冲突时，标记"数据源异常，建议人工复核"
-- 营收数据出现两条不一致的记录，取更保守值并注明
-- 增长率环比波动超过 50% 时，核实是否为正常业务周期或数据错误
-
-**标注要求**
-- 任何超出正常范围的极端值，须在报告中添加脚注或括号标注提醒读者
-- 不确定的数据使用"约、估计、根据有限数据"等限定词"""
+from app.analysis.master_prompt import build_system_prompt
+from app.llm.schemas import SegmentResult
+from app.llm.structured import parse_llm_json
+from app.trust import strict_mode
 
 ROLE_VALUATION_ANALYST = "你是一位资深投行估值分析师，擅长企业估值建模，精通 DCF、SOTP、可比公司分析等多种估值方法。"
 
@@ -203,7 +87,7 @@ class SegmentAnalyzer:
     def __init__(self):
         self._client = analysis_llm
 
-    def identify_segments(self, company_info: dict) -> list[dict]:
+    def identify_segments(self, company_info: dict, macro_line: str = "") -> list[dict]:
         """使用 LLM 识别业务分部
 
         Args:
@@ -228,14 +112,15 @@ class SegmentAnalyzer:
         )
 
         try:
-            system_prompt = f"{ROLE_VALUATION_ANALYST}\n\n{MASTER_SYSTEM_PROMPT}"
+            system_prompt = build_system_prompt(ROLE_VALUATION_ANALYST, macro_line)
             response = self._client.chat(
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=1024,
                 system_prompt=system_prompt,
             )
-            result = self._parse_json_response(response, {})
+            result = parse_llm_json(response, model=SegmentResult, default={},
+                                    context="业务分部")
             segments = result.get("segments", []) if isinstance(result, dict) else []
             if not segments:
                 logger.warning("LLM 未返回有效分部，使用默认单分部")
@@ -300,6 +185,15 @@ class SegmentAnalyzer:
                     "per_share_low": None, "per_share_high": None,
                     "upside_low": None, "upside_high": None,
                     "note": "净利润数据不足，无法计算 SOTP"}
+
+        # 分部没识别出来时，所谓「加总」只剩一个 100% 的分部，本质是拿单一
+        # PE 倍数乘以净利润——那是相对估值，不是分部加总。不出数，说明原因。
+        if any(isinstance(s, dict) and s.get("degraded") for s in segments):
+            return {"segments": segments, "sotp_value_low": None, "sotp_value_high": None,
+                    "per_share_low": None, "per_share_high": None,
+                    "upside_low": None, "upside_high": None,
+                    "degraded": True,
+                    "reason": "业务分部识别失败，单分部不构成加总估值，故不输出 SOTP 数值"}
 
         sotp_result = []
         total_value_low = 0.0
@@ -367,25 +261,20 @@ class SegmentAnalyzer:
         return result
 
     def _default_segment(self) -> dict:
-        """LLM 失败时的默认单分部"""
-        return {
+        """LLM 失败时的单分部占位。
+
+        占位分部保留 100% 占比只是为了让下游算术不崩；这不是识别结果，
+        必须带 degraded 标记，否则「综合业务 100%」会被当成真实分部。
+        """
+        seg = {
             "name": "综合业务",
             "revenue_share": 1.0,
             "net_income_share": 1.0,
             "segment_type": "其他",
             "description": "无法细分业务分部",
         }
+        if strict_mode():
+            seg["degraded"] = True
+            seg["reason"] = "LLM 未返回有效分部，此为单分部占位而非识别结果"
+        return seg
 
-    def _parse_json_response(self, response: str, default):
-        if not response:
-            return default
-        text = response.strip()
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            logger.warning("LLM 返回非 JSON 格式: %s", text[:100])
-            return default

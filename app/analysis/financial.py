@@ -178,11 +178,13 @@ class FinancialAnalyzer:
             if s["value"] is not None:
                 fcf_history.append(s["value"])
 
-        # 提取当前股价
+        # 提取当前股价：当日 K 线可能尚未成交而整行 NaN，取最近一个有值的收盘
         current_price = None
         if price_data is not None and not price_data.empty:
             close_col = "Close" if "Close" in price_data.columns else price_data.columns[0]
-            current_price = float(price_data[close_col].iloc[-1])
+            closes = pd.to_numeric(price_data[close_col], errors="coerce").dropna()
+            if not closes.empty:
+                current_price = float(closes.iloc[-1])
 
         # Phase 6: 行业特有财务指标（NIM/NPL/NAV 等）
         industry_specific_ratios = {}
@@ -529,12 +531,20 @@ class FinancialAnalyzer:
             if yp.empty:
                 continue
             close_col = "Close" if "Close" in yp.columns else yp.columns[0]
-            avg_price = float(yp[close_col].mean())
+            closes = pd.to_numeric(yp[close_col], errors="coerce").dropna()
+            if closes.empty:
+                continue
+            avg_price = float(closes.mean())
+            if not np.isfinite(avg_price):
+                continue
             pairs.append((year, avg_price * shares / ni))
         if len(pairs) < 3:
             return {"pe_percentile": None, "note": f"历史 PE 样本不足({len(pairs)})"}
         close_col = "Close" if "Close" in price_data.columns else price_data.columns[0]
-        cur_price = float(price_data[close_col].iloc[-1])
+        all_closes = pd.to_numeric(price_data[close_col], errors="coerce").dropna()
+        if all_closes.empty:
+            return {"pe_percentile": None, "note": "缺当前收盘价"}
+        cur_price = float(all_closes.iloc[-1])
         latest_ni = self._get_val(aligned, years[-1], "NET_INCOME")
         if not latest_ni or latest_ni <= 0:
             return {"pe_percentile": None, "note": "最新净利为负，PE 不适用"}
@@ -545,7 +555,10 @@ class FinancialAnalyzer:
             "pe_percentile": round(pct, 3),
             "current_pe": round(cur_pe, 2),
             "hist_pe": [round(p, 2) for p in hist_pe],
-            "note": "近似：股本取当前值、PE=当年均价×股本/当年净利，仅供区间参考",
+            # 与 hist_pe 同一次循环产出，不可能错位；没有它只能靠「和 periods 对齐」去猜
+            "hist_pe_periods": [str(p[0]) for p in pairs],
+            "note": "近似：股本取当前值、PE=当年均价×股本/当年净利；"
+                    "样本为上述年度的全年均价，仅供区间参考",
         }
 
     def _compute_market_ratio(

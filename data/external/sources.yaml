@@ -1,0 +1,133 @@
+# 外部语料源登记表 —— 采集白名单。
+#
+# 只登记在此文件里的源才允许被 Fetcher 访问；未登记的 host 一律拒采。
+# license_class 受 app/rag/acquire/policy.py 的白名单枚举约束，写错即加载失败。
+#
+# license_class 取值（只此三类）：
+#   public_domain_statute  《著作权法》第五条 —— 法律法规、国家机关决议决定命令等不受保护
+#   public_record          法定公开记录（美国联邦公开记录 / 交易所法定披露文件）
+#   open_access            作者或机构授权开放获取
+#
+# 券商研报受著作权保护，不在白名单内，本轮零采集。
+
+version: 1
+updated: "2026-11-05"
+
+# 全网兜底纪律：无论单个源怎么写，都不允许低于这些下限
+floors:
+  min_interval_s: 0.25      # SEC 的 5 req/s 就是 0.2s，留一点余量
+  max_retries: 3            # 429 退避重试上限，超过即 not_collected
+
+sources:
+  - id: gov_cn
+    name: 中国政府网 · 国务院政策文件库
+    home: https://www.gov.cn/
+    hosts: [www.gov.cn]
+    license_class: public_domain_statute
+    license_note: >-
+      《中华人民共和国著作权法》第五条：法律、法规，国家机关的决议、决定、
+      命令和其他具有立法、行政、司法性质的文件不适用本法。仅取政策文件正文，
+      不取配图、不取评论文章。
+    kinds: [政策]
+    quota: 80
+    min_interval_s: 2.0
+    max_retries: 3
+    user_agent: browser
+    # 2026-11-05 实测 robots.txt：22 条 Disallow，集中在 /2016*/ 旧版栏目
+    # 与个别历史页面；政策文章页 /zhengce/content/ 不在其中
+    robots_denied_prefixes:
+      - /2016gov/
+      - /2016shuju/
+      - /2016guoqing/
+      - /2016zhengce/
+      - /2016hudong/
+      - /2016fuwu/
+      - /2016xinwen/
+      - /2016guowuyuan/
+      - /2016public/
+      - /2016ducha/
+      - /guowuyuan/yangjing/
+      - /guowuyuan/yj.htm
+      - /c16629/gwyld_yj.htm
+      - /guowuyuan/yj_hy.htm
+      - /guoqing/2013-03/16/content_2583121.htm
+      - /guowuyuan/2015-12/24/content_5027563.htm
+      - /zhuanti/2014-04/02/content_2823336.htm
+      - /zmyw201202b/
+      - /zmyw201212c/
+      - /ldhd/wjb/tp.htm
+      - /guowuyuan/zl_gallery03.htm
+      - /premier/
+    robots_note: >-
+      实测 22 条 Disallow，全部是旧版栏目与个别历史页面；政策正文
+      /zhengce/content/ 未被禁止。之前只登记了 /2016zhengce/ 一条，属漏记，已补齐。
+
+  - id: sec_edgar
+    name: SEC EDGAR
+    home: https://www.sec.gov/edgar/
+    hosts: [www.sec.gov, data.sec.gov]
+    license_class: public_record
+    license_note: >-
+      美国联邦公开记录。SEC《Web 抓取须知》明文允许抓取，要求声明应用名与
+      联系方式、且不超过 10 req/s；本采集器取 2 req/s 保守值。
+    kinds: [披露文件]
+    quota: 30
+    min_interval_s: 0.5
+    max_retries: 3
+    user_agent: sec
+    robots_denied_prefixes: []
+    robots_note: "SEC 以《Web 抓取须知》替代常规 robots 约束；伪装浏览器 UA 会被 403"
+
+  - id: cninfo
+    name: 巨潮资讯网（深沪交易所指定披露平台）
+    home: http://www.cninfo.com.cn/
+    hosts: [www.cninfo.com.cn, static.cninfo.com.cn]
+    license_class: public_record
+    license_note: >-
+      上市公司依法定程序公开披露的定期报告与决议文件，属公开披露信息。
+      仅抓取正文 PDF，低频访问。
+    kinds: [披露文件]
+    quota: 25
+    min_interval_s: 2.0
+    max_retries: 3
+    user_agent: browser
+    robots_denied_prefixes: []
+    robots_note: "2026-11-05 实测 robots.txt 返回 404（不存在），按公开披露属性低频访问"
+
+  - id: hkexnews
+    name: HKEXnews 披露易
+    home: https://www1.hkexnews.hk/
+    hosts: [www1.hkexnews.hk, www.hkexnews.hk]
+    license_class: public_record
+    license_note: >-
+      港交所法定披露平台，上市公司公告与股东会文件属公开披露信息。
+    kinds: [披露文件]
+    quota: 10
+    min_interval_s: 2.0
+    max_retries: 2
+    user_agent: browser
+    robots_denied_prefixes: []
+    robots_note: "2026-11-05 实测 robots.txt 返回 404；接口可能不可用，不可用即 not_collected"
+
+  - id: arxiv
+    name: arXiv（q-fin / econ）
+    home: https://arxiv.org/
+    # export.arxiv.org 实测 robots 为 Disallow: /，已移出白名单，避免误用官方 API
+    hosts: [arxiv.org]
+    license_class: open_access
+    license_note: >-
+      作者以 arXiv 许可协议提交的预印本全文，开放获取。按站点 robots 的
+      Crawl-delay 严格执行，只取 q-fin.* 与 econ.*。逐篇许可另记在文档元数据里；
+      带 NC（非商业）限制的逐篇许可不收，落 not_collected(license_denied)。
+    kinds: [论文]
+    quota: 30
+    min_interval_s: 15.0
+    max_retries: 2
+    user_agent: browser
+    # 2026-11-05 实测 robots.txt：Crawl-delay: 15，Allow /list /abs /pdf
+    crawl_delay_s: 15
+    robots_denied_prefixes: []
+    robots_note: >-
+      实测 arxiv.org 的 robots：Crawl-delay: 15，Allow /list /abs /pdf，
+      Disallow /api /search；export.arxiv.org 为 Disallow: /。官方 Atom API
+      在被禁路径上，故本适配器不用 API，改走 /list + /abs + /pdf。

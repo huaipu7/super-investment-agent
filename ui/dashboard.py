@@ -22,9 +22,12 @@ st.set_page_config(page_title="超级投研 Agent", page_icon="📈", layout="wi
 
 from ui import components
 from ui.pages import quotes, research, chat, market_sentiment, fund, watchlist, compare, backtest
+from ui.pages import fixed_income, investigation, evals, thesis, search
 
 MODULES = ["📊 行情与评分", "📈 深度研究", "💬 AI 对话", "🌡 市场情绪",
-           "📦 基金分析", "⭐ 自选股", "🆚 多股对比", "🔬 回测验证"]
+           "📦 基金分析", "⭐ 自选股", "🆚 多股对比", "🔬 回测验证",
+           "🧱 固收研究", "🧭 自主深度调查", "🧪 评测看板", "🧾 论点台账",
+           "🔍 知识库检索"]
 
 with st.sidebar:
     st.title("🧭 超级投研 Agent")
@@ -55,5 +58,18 @@ elif nav == MODULES[5]:
     watchlist.page()
 elif nav == MODULES[6]:
     compare.page()
-else:
+elif nav == MODULES[7]:
     backtest.page()
+elif nav == MODULES[8]:
+    fixed_income.page()
+elif nav == MODULES[9]:
+    investigation.page()
+elif nav == MODULES[10]:
+    evals.page()
+elif nav == MODULES[11]:
+    thesis.page()
+elif nav == MODULES[12]:
+    search.page()
+else:
+    # 刻意不写兜底页面：新增模块忘记加 elif 时，这里显式报错而不是静默错路由
+    st.error(f"未注册的模块：{nav}（请检查 MODULES 与 if/elif 链是否同步）")

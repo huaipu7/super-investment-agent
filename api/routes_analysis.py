@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from datetime import datetime
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -14,11 +16,13 @@ from pydantic import BaseModel
 
 from app.analysis.pipeline import AnalysisOrchestrator
 from app.analysis.cache import cached_status, get_cached_result, set_cached_result
+from app.config import BASE_DIR
 from app.analysis.valuation import recompute_dcf_from_result
 from app.audit.log import audit
 from app.audit.middleware import get_request_id
 from app.observability.metrics import metrics
 from app.report.generator import ReportGenerator
+from app.trust.ledger import content_hash  # 接受 dict，audit.log 的同名函数只收字符串
 from app.utils.logger import logger
 
 router = APIRouter(prefix="/api/v1", tags=["analysis"])
@@ -42,6 +46,12 @@ def _run_analysis(ticker: str, request_id: str = ""):
     try:
         orchestrator = AnalysisOrchestrator()
         result = orchestrator.run(ticker, progress_cb=task["progress"].append)
+        # 报告反馈的关联键：内容哈希作 report_id（同一份报告多次打开仍算同一份），
+        # request_id 指回本次分析请求。旧缓存产物没有这两个字段，UI 据此不显示反馈组件。
+        report_id = f"report:{ticker}:{content_hash(result)}"
+        result["report_id"] = report_id
+        result["request_id"] = request_id
+        task["report_id"] = report_id
         task["result"] = result
         task["status"] = "completed"
         set_cached_result(ticker, result)  # 持久化，进程重启后仍可命中
@@ -258,4 +268,128 @@ def recompute_dcf(req: DcfRecomputeRequest):
     audit("analysis.recompute_dcf", {"ticker": t, "wacc": req.wacc,
                                      "terminal_growth": req.terminal_growth},
           request_id=get_request_id())
+    return out
+
+
+# ── 增量刷新 & 事实级对比 ────────────────────────────────────
+
+ARTIFACT_DIR = (BASE_DIR / "data" / "artifacts").resolve()
+
+
+def _artifact_path(ref: str) -> Path:
+    """只允许 data/artifacts 下的 .json，挡住路径穿越。"""
+    raw = Path(ref)
+    p = (raw if raw.is_absolute() else BASE_DIR / raw).resolve()
+    if ARTIFACT_DIR not in p.parents:
+        raise HTTPException(status_code=400,
+                            detail="artifact_ref 必须指向 data/artifacts 下的产物")
+    if p.suffix.lower() != ".json" or not p.is_file():
+        raise HTTPException(status_code=404, detail=f"产物不存在：{ref}")
+    return p
+
+
+def _artifact_ref(p: Path) -> str:
+    try:
+        return p.relative_to(BASE_DIR).as_posix()
+    except ValueError:
+        return p.as_posix()
+
+
+def _latest_artifact(ticker: str) -> Path | None:
+    d = ARTIFACT_DIR / ticker.upper().replace(".", "_")
+    if not d.is_dir():
+        return None
+    files = sorted(d.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+    return files[0] if files else None
+
+
+class RefreshRequest(BaseModel):
+    base_ref: str | None = None
+
+
+class DiffRequest(BaseModel):
+    old_ref: str | None = None
+    new_ref: str | None = None       # 省略时用当前缓存结果
+
+
+@router.post("/analysis/refresh/{ticker}")
+def refresh_analysis(ticker: str, req: RefreshRequest = RefreshRequest()):
+    """行情增量刷新：只重取行情与由现价决定的结论，不调 LLM。"""
+    from app.analysis.refresh import refresh_price, summarize_refresh
+    from app.trust.factdiff import diff_facts
+
+    t = ticker.strip().upper()
+    if req.base_ref:
+        base_path = _artifact_path(req.base_ref)
+        base = json.loads(base_path.read_text(encoding="utf-8"))
+        base_at = datetime.fromtimestamp(
+            base_path.stat().st_mtime).strftime("%Y-%m-%dT%H:%M:%S")
+        base_ref = _artifact_ref(base_path)
+    else:
+        cached = get_cached_result(t)
+        if cached is not None:
+            base, base_ref, base_at = cached, "", ""
+        else:
+            base_path = _latest_artifact(t)
+            if base_path is None:
+                raise HTTPException(status_code=404,
+                                    detail=f"未找到 {t} 的分析结果，先跑一次全量分析")
+            base = json.loads(base_path.read_text(encoding="utf-8"))
+            base_at = datetime.fromtimestamp(
+                base_path.stat().st_mtime).strftime("%Y-%m-%dT%H:%M:%S")
+            base_ref = _artifact_ref(base_path)
+
+    try:
+        result = refresh_price(base, base_ref=base_ref, base_generated_at=base_at)
+    except Exception as e:
+        logger.error("行情刷新失败 %s: %s", t, e)
+        raise HTTPException(status_code=400, detail=f"刷新失败: {e}")
+
+    result["report_id"] = f"report:{t}:{content_hash(result)}"
+    result["request_id"] = get_request_id()
+
+    out_dir = ARTIFACT_DIR / t.replace(".", "_")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{datetime.now():%Y%m%dT%H%M%S}.json"
+    out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2,
+                                   default=str, allow_nan=False),
+                        encoding="utf-8")
+    set_cached_result(t, result)
+
+    diff = diff_facts(base, result)
+    audit("analysis.refresh_price", {"ticker": t, "artifact": _artifact_ref(out_path)},
+          request_id=get_request_id())
+    return {
+        "ticker": t,
+        "artifact_ref": _artifact_ref(out_path),
+        "refresh": summarize_refresh(result),
+        "diff": diff["summary"],
+        "completeness": result.get("completeness"),
+    }
+
+
+@router.post("/analysis/diff")
+def diff_analysis(req: DiffRequest):
+    """事实级跨 run 对比：按「路径 + 期间」对齐两份产物。"""
+    from app.trust.factdiff import diff_facts
+
+    if not req.old_ref:
+        raise HTTPException(status_code=400, detail="缺少 old_ref")
+    old_path = _artifact_path(req.old_ref)
+    old = json.loads(old_path.read_text(encoding="utf-8"))
+
+    if req.new_ref:
+        new_path = _artifact_path(req.new_ref)
+        new = json.loads(new_path.read_text(encoding="utf-8"))
+        new_ref = _artifact_ref(new_path)
+    else:
+        ticker = old.get("ticker") or ""
+        cached = get_cached_result(ticker) if ticker else None
+        if cached is None:
+            raise HTTPException(status_code=404, detail="没有当前结果可对比")
+        new, new_ref = cached, "current"
+
+    out = diff_facts(old, new)
+    out["old"]["ref"] = _artifact_ref(old_path)
+    out["new"]["ref"] = new_ref
     return out

@@ -1,7 +1,8 @@
 """长时记忆 —— SQLite data/memory.db（单用户，无鉴权，actor=local）。
 
 表:
-  conversations(id, role, content, intent, tickers, created_at)  只 INSERT
+  conversations(id, role, content, intent, tickers, created_at,
+                msg_id, model, prompt_version, git_sha)  只 INSERT
   user_profiles(key, value, updated_at)                         UPSERT
   sessions(id, summary, updated_at)                             滚动摘要（只 INSERT）
 
@@ -23,7 +24,11 @@ CREATE TABLE IF NOT EXISTS conversations (
     content TEXT NOT NULL,
     intent TEXT,
     tickers TEXT,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    msg_id TEXT,
+    model TEXT,
+    prompt_version TEXT,
+    git_sha TEXT
 );
 CREATE TABLE IF NOT EXISTS user_profiles (
     key TEXT PRIMARY KEY,
@@ -39,6 +44,18 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 _local = threading.local()
 
+_COLUMN_MIGRATIONS = (("msg_id", "TEXT"), ("model", "TEXT"),
+                      ("prompt_version", "TEXT"), ("git_sha", "TEXT"))
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """旧库就地补列（幂等）。历史行 msg_id/版本戳留 NULL，不回溯编造。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(conversations)")}
+    for name, typ in _COLUMN_MIGRATIONS:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE conversations ADD COLUMN {name} {typ}")
+    conn.commit()
+
 
 def _connection() -> sqlite3.Connection:
     conn = getattr(_local, "conn", None)
@@ -47,6 +64,7 @@ def _connection() -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=3000")
         conn.executescript(_SCHEMA)
+        _migrate(conn)
         _local.conn = conn
     return conn
 
@@ -59,14 +77,23 @@ def init_db() -> None:
 # ── 对话历史（只 INSERT）─────────────────────────────────────
 
 def add_message(role: str, content: str, intent: str | None = None,
-                tickers: list[str] | None = None) -> int:
-    """追加一条消息，返回自增 id。"""
+                tickers: list[str] | None = None,
+                msg_id: str | None = None) -> int:
+    """追加一条消息，返回自增 id。
+
+    msg_id 是反馈关联键：feedback.msg_id → conversations.msg_id，
+    缺了它 feedback_coverage 无法计算。
+    """
+    from app.observability.version import stamp
+
+    ver = stamp()
     tickers_json = json.dumps(list(tickers), ensure_ascii=False) if tickers else None
     conn = _connection()
     cur = conn.execute(
-        "INSERT INTO conversations(role, content, intent, tickers, created_at) "
-        "VALUES (?,?,?,?,?)",
-        (role, content, intent, tickers_json, time.time()),
+        "INSERT INTO conversations(role, content, intent, tickers, created_at,"
+        " msg_id, model, prompt_version, git_sha) VALUES (?,?,?,?,?,?,?,?,?)",
+        (role, content, intent, tickers_json, time.time(), msg_id,
+         ver["model"], ver["prompt_version"], ver["git_sha"]),
     )
     conn.commit()
     return int(cur.lastrowid)
@@ -102,8 +129,14 @@ def recent_messages(limit: int = 50) -> list[dict]:
     return out
 
 
-def count_messages() -> int:
-    row = _connection().execute("SELECT COUNT(*) FROM conversations").fetchone()
+def count_messages(role: str | None = None) -> int:
+    """消息条数；给 role 时只数该角色（feedback_coverage 的分母）。"""
+    conn = _connection()
+    if role:
+        row = conn.execute("SELECT COUNT(*) FROM conversations WHERE role=?",
+                           (role,)).fetchone()
+    else:
+        row = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()
     return int(row[0]) if row else 0
 
 

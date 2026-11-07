@@ -51,6 +51,14 @@ class Metrics:
             self._counters.clear()
             self._latency.clear()
 
+    def guardrails(self) -> dict:
+        """五个护栏指标（质量 3 + 飞轮健康度 2）。口径见 guardrails.py。"""
+        from app.observability.guardrails import snapshot
+
+        with self._lock:
+            counters = dict(self._counters)
+        return snapshot(counters)
+
     def data_sources(self) -> dict:
         """按数据源聚合健康指标（Phase 4）。
 

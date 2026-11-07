@@ -325,6 +325,52 @@ class LLMClient:
         return ChatResult(text="抱歉，工具调用轮数超限，请简化问题重试。",
                           messages=msgs, tool_calls=log)
 
+    def chat_once_with_tools(
+        self,
+        messages: list[dict],
+        system: str | None = None,
+        tools: list[dict] | None = None,
+        max_tokens: int | None = None,
+        task: str | None = None,
+    ) -> ChatResult:
+        """只发一次请求，返回 text + **未执行**的 tool_use 块（不做工具循环）。
+
+        供自主调查等需要"执行前拦截"的场景使用：调用方自己掌握工具的执行、计数、
+        去重与刹车。与 chat_with_tools 的区别在于后者会无条件执行整轮全部工具，
+        没有执行前否决点，因此无法在预算触顶时中途停下。
+
+        `tool_calls` 形如 [{id, name, input}]（input 是活 dict，不是 JSON 串）；
+        `raw.get("stop_reason") == "tool_use"` 表示模型要调工具，"end_turn" 表示
+        它直接给了答案。本方法不接触 tool_executor，故不存在执行失败路径。
+
+        注意：与 chat_with_tools 不同，本方法**不会**产生"轮数超限哨兵"——只有
+        一次请求，没有轮次概念。哨兵只可能来自调用方自己的循环。
+        """
+        def _do(model: str) -> dict:
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.post(
+                    self._messages_url,
+                    headers=self._headers(),
+                    json=self._build_body(messages, system, max_tokens, tools, model=model),
+                )
+                data = self._raise_for_response(resp)
+            self._record_usage(data, messages)
+            return data
+
+        data = self._retry_call(_do, task)
+        _, tool_blocks = self._split_tool_blocks(data)
+        calls = [{
+            "id": b.get("id", ""),
+            "name": b.get("name", ""),
+            "input": b.get("input") or {},
+        } for b in tool_blocks]
+        return ChatResult(
+            text=self._extract_text(data),
+            messages=list(messages),
+            tool_calls=calls,
+            raw=data,
+        )
+
     def stream(self, messages: list[dict], system: str | None = None,
                max_tokens: int | None = None, task: str | None = None) -> Iterator[str]:
         """同步流式对话，逐 token 产出文本片段。task 用于模型路由。

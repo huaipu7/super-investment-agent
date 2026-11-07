@@ -54,11 +54,23 @@ class Settings(BaseSettings):
     # ── 服务 ────────────────────────────────────────────────────────
     SERVER_PORT: int = 8000
 
+    # ── 可信层 ──────────────────────────────────────────────────────
+    # 严格模式（默认开）：输入缺失时不再静默兜底，而是显式标记降级并写明
+    # 假设，或无值就返回 None。关闭后回到历史兜底行为，仅用于前后对比。
+    TRUST_STRICT_MODE: bool = True
+
     # ── 数据源开关 ──────────────────────────────────────────────────
     SOURCE_YFINANCE: bool = True
     SOURCE_AKSHARE: bool = True
     SOURCE_SINA: bool = True
     SOURCE_FUND: bool = True
+    # 固收零 key 源（Phase 1）
+    SOURCE_TREASURY: bool = True
+    SOURCE_EDGAR: bool = True
+    SOURCE_FOMC: bool = True
+    # SEC 要求 UA 带真实联系方式，否则 403。默认值是占位邮箱，
+    # 正式使用请改成自己的（https://www.sec.gov/os/webmaster-faq#developers）。
+    SEC_USER_AGENT: str = "Super-Investment-Agent research-agent@example.com"
 
     # ── RAG（默认可开；无任何嵌入后端时静默降级为无 RAG 分支）──────
     RAG_ENABLED: bool = True
@@ -67,6 +79,9 @@ class Settings(BaseSettings):
     EMBEDDING_API_BASE: str = ""
     EMBEDDING_API_KEY: str = ""
     EMBEDDING_MODEL: str = ""
+    # 二段重排（cross-encoder）。默认关：不装模型、不改排序。
+    # 模型缺失时自动退回原顺序，不会报错；v1 只读快照永远旁路（L2 基线不许动）。
+    RERANK_ENABLED: bool = False
 
     # ── MCP（工具桥，默认关闭；真实数据源等凭据后再配）────────────
     MCP_ENABLED: bool = False
@@ -81,6 +96,30 @@ class Settings(BaseSettings):
     LLM_RETRY: int = 3
     LLM_RETRY_BACKOFF: float = 0.5
 
+    # ── 自主深度调查（预算硬约束：下列数值是天花板，不是建议值）──────
+    # 两档：standard（标准，默认）/ deep（深度），由请求的 depth 参数选择。
+    # 三重硬上限（轮次 / 工具调用 / LLM 调用）+ 墙钟 deadline，另有去重与
+    # 无进展检测。llm_calls 必须单独计数：compare_peers 内部会烧掉 1 次 LLM，
+    # 不单独计则预算失真。
+    INVESTIGATION_ENABLED: bool = True
+    INVESTIGATION_STANDARD_MAX_ROUNDS: int = 6
+    INVESTIGATION_STANDARD_MAX_TOOL_CALLS: int = 14
+    INVESTIGATION_STANDARD_MAX_LLM_CALLS: int = 10
+    INVESTIGATION_STANDARD_DEADLINE_SECONDS: int = 300
+    INVESTIGATION_STANDARD_MAX_HYPOTHESES: int = 4
+    INVESTIGATION_STANDARD_MAX_EVIDENCE_PER_HYPOTHESIS: int = 4
+    INVESTIGATION_STANDARD_MAX_PEERS: int = 3
+    INVESTIGATION_DEEP_MAX_ROUNDS: int = 12
+    INVESTIGATION_DEEP_MAX_TOOL_CALLS: int = 32
+    INVESTIGATION_DEEP_MAX_LLM_CALLS: int = 20
+    INVESTIGATION_DEEP_DEADLINE_SECONDS: int = 720
+    INVESTIGATION_DEEP_MAX_HYPOTHESES: int = 8
+    INVESTIGATION_DEEP_MAX_EVIDENCE_PER_HYPOTHESIS: int = 6
+    INVESTIGATION_DEEP_MAX_PEERS: int = 5
+    # 连续 N 轮无新增证据/无状态变化 → 停；剩余时间不足该秒数时拒绝开新一轮
+    INVESTIGATION_NO_PROGRESS_WINDOW: int = 3
+    INVESTIGATION_MIN_ROUND_SECONDS: int = 60
+
     # ── SQLite（统一缓存与自选股，替换 Redis / Neo4j）──────────────
     CACHE_DB_PATH: str = "data/cache.db"
     ANALYSIS_CACHE_DB_PATH: str = "data/analysis_cache.db"
@@ -88,6 +127,11 @@ class Settings(BaseSettings):
     AUDIT_DB_PATH: str = "data/audit.db"
     COMPLIANCE_DB_PATH: str = "data/compliance.db"
     MEMORY_DB_PATH: str = "data/memory.db"
+    FEEDBACK_DB_PATH: str = "data/feedback.db"
+    # 论点台账：结论 / 假设 / 证伪条件 / 证据 / 复盘
+    THESIS_DB_PATH: str = "data/thesis.db"
+    # 👎 待审队列：只进人工审阅，绝不自动进回归集
+    FLYWHEEL_DIR_PATH: str = "data/flywheel"
 
     @property
     def base_dir(self) -> Path:
@@ -116,6 +160,18 @@ class Settings(BaseSettings):
     @property
     def memory_db(self) -> Path:
         return BASE_DIR / self.MEMORY_DB_PATH
+
+    @property
+    def feedback_db(self) -> Path:
+        return BASE_DIR / self.FEEDBACK_DB_PATH
+
+    @property
+    def thesis_db(self) -> Path:
+        return BASE_DIR / self.THESIS_DB_PATH
+
+    @property
+    def flywheel_dir(self) -> Path:
+        return BASE_DIR / self.FLYWHEEL_DIR_PATH
 
     def check_llm_ready(self) -> bool:
         """LLM 配置是否就绪（未配置密钥时返回 False）。"""

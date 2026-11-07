@@ -63,6 +63,19 @@ def metrics() -> dict:
         return {}
 
 
+# ── 数据飞轮 ──────────────────────────────────────────
+
+def feedback(request_id: str, msg_id: str, label: str, *, scope: str = "message",
+             fact_id: str | None = None, options: list[str] | None = None,
+             note: str | None = None) -> dict:
+    """提交一条 👍/👎。request_id / msg_id 来自后端回传，缺一不可。"""
+    return _json("POST", "/api/v1/feedback", json={
+        "request_id": request_id, "msg_id": msg_id, "label": label,
+        "scope": scope, "fact_id": fact_id or None,
+        "options": options or [], "note": (note or "").strip() or None,
+    })
+
+
 # ── 行情 / 财务 / 评分 ─────────────────────────────────
 
 def search(q: str) -> list[dict]:
@@ -117,6 +130,46 @@ def analysis_stream(ticker: str) -> requests.Response:
                 stream=True, timeout=(10, 900))
 
 
+# ── 自主深度调查（假设驱动）─────────────────────────────
+
+def investigation_run(ticker: str, depth: str = "standard",
+                      period: str = "annual") -> dict:
+    """启动调查（后台线程），返回 {ticker, run_id, depth, status}。"""
+    return _json("POST", f"/api/v1/investigation/run/{ticker}",
+                 params={"depth": depth, "period": period})
+
+
+def investigation_run_sync(ticker: str, depth: str = "standard",
+                           period: str = "annual") -> dict:
+    """同步跑完并返回报告（耗时可达分钟级；脚本用）。"""
+    return _json("POST", f"/api/v1/investigation/run-sync/{ticker}",
+                 params={"depth": depth, "period": period}, timeout=1200)
+
+
+def investigation_status(run_id: str) -> dict:
+    return _json("GET", f"/api/v1/investigation/status/{run_id}")
+
+
+def investigation_result(run_id: str) -> dict:
+    return _json("GET", f"/api/v1/investigation/result/{run_id}")
+
+
+def investigation_result_by_ticker(ticker: str, depth: str = "standard") -> dict:
+    return _json("GET", f"/api/v1/investigation/result/by-ticker/{ticker}",
+                 params={"depth": depth})
+
+
+def investigation_report_md(run_id: str) -> str:
+    """确定性 Markdown 报告（缺失数值渲染为 —）。"""
+    return _req("GET", f"/api/v1/investigation/report/{run_id}").text
+
+
+def investigation_stream(run_id: str) -> requests.Response:
+    """SSE 进度流：progress（含 spent/round/hypotheses）→ status/done/error。"""
+    return _req("GET", f"/api/v1/investigation/stream/{run_id}",
+                stream=True, timeout=(10, 900))
+
+
 def recompute_dcf(ticker: str, *, wacc: float | None = None,
                   terminal_growth: float = 0.03, projection_years: int = 5,
                   beta: float | None = None, risk_free_rate: float | None = None,
@@ -127,6 +180,18 @@ def recompute_dcf(ticker: str, *, wacc: float | None = None,
         "projection_years": projection_years, "beta": beta,
         "risk_free_rate": risk_free_rate, "erp": erp,
     })
+
+
+def refresh_analysis(ticker: str, *, base_ref: str | None = None) -> dict:
+    """行情增量刷新（不调 LLM）。"""
+    return _json("POST", f"/api/v1/analysis/refresh/{ticker}",
+                 json={"base_ref": base_ref})
+
+
+def diff_analysis(*, old_ref: str, new_ref: str | None = None) -> dict:
+    """事实级跨 run 对比；new_ref 省略时用当前缓存结果。"""
+    return _json("POST", "/api/v1/analysis/diff",
+                 json={"old_ref": old_ref, "new_ref": new_ref})
 
 
 def reports_list(kind: str = "all", ticker: str = "") -> list[dict]:
@@ -228,6 +293,88 @@ def watchlist_news() -> list[dict]:
 
 def compare(tickers: list[str]) -> dict:
     return _json("POST", "/api/v1/compare", json={"tickers": tickers})
+
+
+# ── 论点台账 ──────────────────────────────────────────
+
+def thesis_list(ticker: str = "", status: str = "", with_check: bool = False,
+                limit: int = 100) -> list[dict]:
+    """论点列表。with_check=True 时后端会逐条跑证伪检查并给出 verdict。"""
+    return _json("GET", "/api/v1/thesis", params={
+        "ticker": ticker, "status": status, "limit": limit,
+        "with_check": str(with_check).lower(),
+    }).get("items", [])
+
+
+def thesis_get(thesis_id: str) -> dict:
+    return _json("GET", f"/api/v1/thesis/{thesis_id}")
+
+
+def thesis_create(payload: dict) -> str:
+    return _json("POST", "/api/v1/thesis", json=payload).get("id", "")
+
+
+def thesis_update(thesis_id: str, fields: dict) -> dict:
+    return _json("PATCH", f"/api/v1/thesis/{thesis_id}", json=fields)
+
+
+def thesis_delete(thesis_id: str) -> bool:
+    try:
+        _json("DELETE", f"/api/v1/thesis/{thesis_id}")
+        return True
+    except ApiError:
+        return False
+
+
+def thesis_check(thesis_id: str, artifact_ref: str | None = None) -> dict:
+    return _json("POST", f"/api/v1/thesis/{thesis_id}/check",
+                 json={"artifact_ref": artifact_ref} if artifact_ref else {})
+
+
+def thesis_artifacts(ticker: str = "") -> list[dict]:
+    return _json("GET", "/api/v1/thesis/artifacts",
+                 params={"ticker": ticker}).get("items", [])
+
+
+def thesis_draft(artifact_ref: str) -> dict:
+    return _json("POST", "/api/v1/thesis/draft", json={"artifact_ref": artifact_ref})
+
+
+def thesis_add_evidence(thesis_id: str, ref: str, *, kind: str = "fact",
+                        direction: str = "supports", note: str = "") -> int:
+    return _json("POST", f"/api/v1/thesis/{thesis_id}/evidence", json={
+        "ref": ref, "kind": kind, "direction": direction, "note": note,
+    }).get("id")
+
+
+def thesis_delete_evidence(evidence_id: int) -> bool:
+    try:
+        _json("DELETE", f"/api/v1/thesis/evidence/{evidence_id}")
+        return True
+    except ApiError:
+        return False
+
+
+def thesis_add_review(thesis_id: str, verdict: str, *,
+                      snapshot: dict | None = None, note: str = "") -> int:
+    return _json("POST", f"/api/v1/thesis/{thesis_id}/review", json={
+        "verdict": verdict, "snapshot": snapshot or {}, "note": note,
+    }).get("id")
+
+
+# ── 知识库检索 ────────────────────────────────────────
+
+def kb_search(q: str, kind: str = "", ticker: str = "", top_k: int = 10,
+              rerank: str = "auto") -> dict:
+    """检索切片。返回 {items, reranked, rerank_note, where, count, ...}。"""
+    return _json("GET", "/api/v1/search", params={
+        "q": q, "kind": kind, "ticker": ticker, "top_k": top_k, "rerank": rerank,
+    })
+
+
+def kb_stats() -> dict:
+    """库规模与各类切片数（available / backend / count / kinds）。"""
+    return _json("GET", "/api/v1/search/stats")
 
 
 def fund_watchlist() -> list[dict]:

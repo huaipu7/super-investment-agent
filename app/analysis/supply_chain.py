@@ -235,11 +235,21 @@ class SupplyChainAnalyzer:
         if not sc_cfg.get("has_global_supply_chain"):
             return None
 
+        # 三个输入缺失时会退回硬编码常数。这些常数会一路算成「毛利率影响
+        # -XXbp」，看上去与真实测算无异，所以必须逐项登记，让下游知道某个
+        # 数字是建立在假设上的。
+        assumptions: list[dict] = []
+
+        def _assume(field: str, value: float, why: str) -> float:
+            assumptions.append({"field": field, "value": value, "reason": why})
+            return value
+
         # 获取中国敞口
         tariff = geopolitical_analysis.get("tariff_sensitivity", {})
         china_exposure = tariff.get("china_exposure", 0.0) or 0.0
         if china_exposure <= 0:
-            china_exposure = 0.15  # 默认保守估计
+            china_exposure = _assume(
+                "china_exposure", 0.15, "地缘政治分析未给出中国营收敞口，取保守假设")
 
         # 获取净利润相关数据
         raw_metrics = financial_analysis.get("raw_metrics", {})
@@ -252,9 +262,15 @@ class SupplyChainAnalyzer:
         # 获取毛利率
         ratios = financial_analysis.get("ratios", {})
         gm_series = ratios.get("GROSS_MARGIN", [])
-        gross_margin = gm_series[-1]["value"] if gm_series and gm_series[-1]["value"] is not None else 0.35
+        gross_margin = gm_series[-1]["value"] if gm_series and gm_series[-1]["value"] is not None else None
+        if gross_margin is None:
+            gross_margin = _assume(
+                "gross_margin", 0.35, "财报未给出毛利率，取制造业常见假设")
 
-        net_margin = net_income / revenue if net_income and revenue else 0.15
+        net_margin = net_income / revenue if net_income and revenue else None
+        if net_margin is None:
+            net_margin = _assume(
+                "net_margin", 0.15, "缺净利润或营收，取常见净利率假设")
 
         scenarios_out = []
         for sc in SUPPLY_CHAIN_SCENARIOS:
@@ -281,7 +297,7 @@ class SupplyChainAnalyzer:
         expected_gm = sum(s["gm_impact_bp"] * s["probability"] for s in scenarios_out)
         expected_eps = sum(s["eps_impact_pct"] * s["probability"] for s in scenarios_out)
 
-        return {
+        result = {
             "applicable": True,
             "china_exposure": round(china_exposure, 3),
             "scenarios": scenarios_out,
@@ -291,6 +307,12 @@ class SupplyChainAnalyzer:
             "base_net_margin": round(net_margin, 4),
             "note": "概率加权预期损失反映供应链中断的统计学期望值，实际结果可能因具体事件发展而偏离。",
         }
+        if assumptions:
+            result["degraded"] = True
+            result["assumptions"] = assumptions
+            result["reason"] = "以下输入缺失，改用假设值：" + "；".join(
+                f"{a['field']}={a['value']}（{a['reason']}）" for a in assumptions)
+        return result
 
     # ── 华为竞争/供应链影响评估 ───────────────────────────────
 

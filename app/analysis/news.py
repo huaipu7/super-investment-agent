@@ -5,10 +5,10 @@
 新闻/公告均为空时不调用 LLM，如实返回 available=False。
 """
 
-import json
-
 from app.utils.logger import logger
 from app.analysis.llm import analysis_llm
+from app.llm.schemas import NewsResult
+from app.llm.structured import parse_llm_json
 
 NEWS_SYSTEM_PROMPT = """你是一位资深证券分析师，擅长从公司新闻与公告中识别市场情绪的边际变化。
 你的分析必须严格基于提供的新闻/公告原文，不得引入外部或虚构信息。输出结构化 JSON。"""
@@ -101,14 +101,15 @@ class NewsAnalyzer:
                 max_tokens=1024,
                 system_prompt=NEWS_SYSTEM_PROMPT,
             )
-            result = self._parse_json(response, {})
+            result = parse_llm_json(response, model=NewsResult, default={},
+                                    context="新闻舆情")
             if not isinstance(result, dict):
                 result = {}
         except Exception as e:
             logger.error("新闻舆情分析失败: %s", e)
             result = {}
 
-        return {
+        out = {
             "available": True,
             "source": source or "新闻数据源",
             "article_count": len(articles),
@@ -121,6 +122,15 @@ class NewsAnalyzer:
             "risks_opportunities": self._clean_list(result.get("risks_opportunities")),
             "summary": str(result.get("summary", "")) if result.get("summary") else "",
         }
+        # 文章拿到了但舆情没分析出来：数据可用（计数是真的），分析降级。
+        # 这里刻意不用 `degraded` 键——那个键会向下传播，把真实可信的
+        # article_count 也标成降级。本 section 是混合出处，只披露不传染。
+        if not result.get("sentiment") and not out["summary"]:
+            out["analysis_degraded"] = True
+            out["reason"] = (
+                f"已获取 {len(articles)} 篇新闻/{len(briefings)} 篇公告，"
+                "但 LLM 未产出有效舆情分析")
+        return out
 
     @staticmethod
     def _to_score(value):
@@ -158,16 +168,3 @@ class NewsAnalyzer:
             "reason": reason,
         }
 
-    def _parse_json(self, text, default):
-        if not text:
-            return default
-        t = text.strip()
-        if "```json" in t:
-            t = t.split("```json", 1)[1].split("```", 1)[0].strip()
-        elif "```" in t:
-            t = t.split("```", 1)[1].rsplit("```", 1)[0].strip()
-        try:
-            return json.loads(t)
-        except json.JSONDecodeError:
-            logger.warning("新闻舆情 LLM 返回非 JSON: %s", t[:100])
-            return default

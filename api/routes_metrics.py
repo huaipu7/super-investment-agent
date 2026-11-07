@@ -16,4 +16,4 @@ router = APIRouter(prefix="/api/v1", tags=["metrics"])
 def get_metrics() -> dict:
     snap = metrics.snapshot()
     snap["data_sources"] = metrics.data_sources()
-    return {"metrics": snap}
+    return {"metrics": snap, "guardrails": metrics.guardrails()}
